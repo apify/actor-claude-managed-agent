@@ -47,6 +47,7 @@ export async function getMcpServer(
         const method = schema.shape.method.value;
         server.server.setRequestHandler(schema, async (req) => {
             if (req.method === 'initialize') {
+                log.info('MCP initialize — replying with cached upstream capabilities');
                 return {
                     capabilities: proxyClient.getServerCapabilities(),
                     protocolVersion: req.params.protocolVersion,
@@ -57,10 +58,17 @@ export async function getMcpServer(
                     },
                 };
             }
-            log.info('Received MCP request', { method, request: req });
-            return proxyClient.request(req, ResultSchema, {
-                timeout: options?.timeout || DEFAULT_REQUEST_TIMEOUT_MSEC,
-            });
+            log.info(`MCP → upstream ${method}`, { params: req.params });
+            try {
+                const result = await proxyClient.request(req, ResultSchema, {
+                    timeout: options?.timeout || DEFAULT_REQUEST_TIMEOUT_MSEC,
+                });
+                log.info(`MCP ← upstream ${method} ok`);
+                return result;
+            } catch (error) {
+                log.error(`MCP ← upstream ${method} failed`, { error: (error as Error).message });
+                throw error;
+            }
         });
     }
 

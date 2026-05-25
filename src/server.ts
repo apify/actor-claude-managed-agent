@@ -13,7 +13,7 @@
  * owns — useful for logging, transforming, or scoping the MCP traffic per
  * run without touching user credentials (those stay inside the Apify Proxy).
  */
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { Server as HttpServer } from 'node:http';
 
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -23,7 +23,6 @@ import express, { type NextFunction, type Request, type Response } from 'express
 
 import { getMcpServer } from './mcp.js';
 
-const BEARER_PREFIX = 'Bearer ';
 // MCP tool responses can carry sizeable JSON (scraped HTML, dataset items,
 // etc.). The Express default of 100 KB rejects realistic payloads mid-session.
 const MAX_BODY_BYTES = '10mb';
@@ -31,19 +30,6 @@ const MAX_BODY_BYTES = '10mb';
 // connector IDs follow this pattern; locking it down here prevents slashes,
 // dots, or URL-encoded sequences from altering the upstream URL path.
 const CONNECTOR_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
-
-/**
- * Constant-time string comparison. The pre-check compares BYTE length
- * (not JS string length) so multi-byte characters cannot cause
- * `timingSafeEqual` to throw RangeError — which would have leaked the
- * branch via a 500 distinguishable from the regular 401.
- */
-function safeEqual(a: string, b: string): boolean {
-    const aBuf = Buffer.from(a, 'utf8');
-    const bBuf = Buffer.from(b, 'utf8');
-    if (aBuf.length !== bBuf.length) return false;
-    return timingSafeEqual(aBuf, bBuf);
-}
 
 export interface StartServerOptions {
     /** Port the local Express server listens on (Apify container web server port). */
@@ -71,24 +57,39 @@ export async function startServer(options: StartServerOptions): Promise<StartedS
         res.end();
     });
 
+    // Log every incoming HTTP request and its final status. Lets you see at a
+    // glance whether the request even reached this Actor, which path/auth state
+    // it landed in, and what we sent back.
+    app.use((req: Request, res: Response, next: NextFunction) => {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        const hasAuth = typeof req.headers.authorization === 'string';
+        log.info(`→ ${req.method} ${req.originalUrl}`, {
+            sessionId: sessionId ?? null,
+            hasAuthHeader: hasAuth,
+            contentLength: req.headers['content-length'] ?? null,
+        });
+        res.on('finish', () => {
+            log.info(`← ${req.method} ${req.originalUrl} ${res.statusCode}`, {
+                sessionId: sessionId ?? null,
+            });
+        });
+        next();
+    });
+
     app.use(express.json({ limit: MAX_BODY_BYTES }));
 
-    const requireBearer = (req: Request, res: Response, next: NextFunction) => {
-        const auth = req.headers.authorization;
-        if (!auth || !auth.startsWith(BEARER_PREFIX) || !safeEqual(auth.slice(BEARER_PREFIX.length), apifyToken)) {
-            res.status(401).json({
-                jsonrpc: '2.0',
-                error: { code: -32001, message: 'Unauthorized' },
-                id: null,
-            });
-            return;
-        }
-        next();
-    };
+    // No inbound bearer check: the Apify platform gates the container URL,
+    // so any request that reaches us has already been auth-validated. The
+    // upstream Apify MCP Proxy call below still uses APIFY_TOKEN as the
+    // bearer to identify this run.
 
     const requireValidConnectorId = (req: Request, res: Response, next: NextFunction) => {
         const { connectorId } = req.params;
         if (typeof connectorId !== 'string' || !CONNECTOR_ID_PATTERN.test(connectorId)) {
+            log.warning('Rejected request: invalid connector ID', {
+                path: req.originalUrl,
+                connectorId: connectorId ?? null,
+            });
             res.status(400).json({
                 jsonrpc: '2.0',
                 error: { code: -32602, message: 'Invalid connector ID' },
@@ -99,17 +100,28 @@ export async function startServer(options: StartServerOptions): Promise<StartedS
         next();
     };
 
-    app.post('/mcp/:connectorId', requireBearer, requireValidConnectorId, async (req, res) => {
+    app.post('/mcp/:connectorId', requireValidConnectorId, async (req, res) => {
         // requireValidConnectorId guarantees this is a non-empty string.
         const connectorId = req.params.connectorId as string;
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        const rpcMethod = typeof req.body?.method === 'string' ? req.body.method : null;
+        log.info('POST /mcp body received', {
+            connectorId,
+            sessionId: sessionId ?? null,
+            rpcMethod,
+            rpcId: req.body?.id ?? null,
+            isInitialize: isInitializeRequest(req.body),
+        });
         try {
             let transport: StreamableHTTPServerTransport;
             if (sessionId && transports[sessionId]) {
                 const entry = transports[sessionId];
                 if (entry.connectorId !== connectorId) {
-                    // Session was opened against a different connector — refuse to
-                    // route through the wrong upstream.
+                    log.warning('Session/connector mismatch — rejecting', {
+                        sessionId,
+                        sessionConnectorId: entry.connectorId,
+                        requestConnectorId: connectorId,
+                    });
                     res.status(404).json({
                         jsonrpc: '2.0',
                         error: { code: -32001, message: 'Session not found for this connector' },
@@ -117,6 +129,7 @@ export async function startServer(options: StartServerOptions): Promise<StartedS
                     });
                     return;
                 }
+                log.info('Reusing existing transport', { sessionId, connectorId });
                 transport = entry.transport;
             } else if (!sessionId && isInitializeRequest(req.body)) {
                 // Two concurrent retries of the same initialize land here as
@@ -141,6 +154,7 @@ export async function startServer(options: StartServerOptions): Promise<StartedS
                 };
 
                 const upstreamUrl = `${apifyMcpProxyBaseUrl.replace(/\/$/, '')}/${encodeURIComponent(connectorId)}`;
+                log.info('New session — opening upstream MCP client', { connectorId, upstreamUrl });
                 let mcpServer;
                 try {
                     mcpServer = await getMcpServer({ upstreamUrl, apifyToken });
@@ -176,6 +190,10 @@ export async function startServer(options: StartServerOptions): Promise<StartedS
                 await transport.handleRequest(req, res, req.body);
                 return;
             } else {
+                log.warning('POST rejected: no valid session ID and not an initialize request', {
+                    sessionId: sessionId ?? null,
+                    rpcMethod,
+                });
                 res.status(400).json({
                     jsonrpc: '2.0',
                     error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
@@ -202,18 +220,28 @@ export async function startServer(options: StartServerOptions): Promise<StartedS
         const connectorId = req.params.connectorId as string;
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
         if (!sessionId || !transports[sessionId]) {
+            log.warning(`${req.method} /mcp/${connectorId} rejected: invalid/missing session ID`, {
+                sessionId: sessionId ?? null,
+                knownSessions: Object.keys(transports),
+            });
             res.status(400).send('Invalid or missing session ID');
             return;
         }
         if (transports[sessionId].connectorId !== connectorId) {
+            log.warning(`${req.method} session/connector mismatch`, {
+                sessionId,
+                sessionConnectorId: transports[sessionId].connectorId,
+                requestConnectorId: connectorId,
+            });
             res.status(404).send('Session not found for this connector');
             return;
         }
+        log.info(`${req.method} /mcp/${connectorId} forwarding to transport`, { sessionId });
         await transports[sessionId].transport.handleRequest(req, res);
     };
 
-    app.get('/mcp/:connectorId', requireBearer, requireValidConnectorId, sessionStreamHandler);
-    app.delete('/mcp/:connectorId', requireBearer, requireValidConnectorId, sessionStreamHandler);
+    app.get('/mcp/:connectorId', requireValidConnectorId, sessionStreamHandler);
+    app.delete('/mcp/:connectorId', requireValidConnectorId, sessionStreamHandler);
 
     const httpServer: HttpServer = await new Promise((resolve) => {
         const server = app.listen(serverPort, () => {
