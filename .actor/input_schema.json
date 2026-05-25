@@ -16,7 +16,14 @@
             "resourceType": "mcpConnector",
             "description": "Apify MCP Connector IDs to expose to the agent. Each connector is re-published by this Actor at https://<container-url>/mcp/<connectorId> and forwarded to the documented Apify MCP Proxy. Create connectors under Settings → API & Integrations → MCP Connectors.",
             "mcpServers": [{ "url": "*" }]
+        },
+        "mcpProxyOnly": {
+            "title": "MCP proxy only (debug)",
+            "type": "boolean",
+            "editor": "hidden",
+            "description": "If true, boot only the local MCP proxy and skip the Claude Managed Agent flow. The run stays alive until aborted so you can point an external MCP client at the container URL.",
+            "default": false
         }
     },
-    "required": ["prompt"]
+    "required": []
 }

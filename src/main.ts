@@ -1,21 +1,27 @@
 /**
  * Apify Actor entrypoint.
  *
- * Flow:
- *   1. Validate input + required env vars.
- *   2. If any MCP Connectors were requested, start a local MCP proxy on the
- *      Actor's web server port. The proxy is reachable from Anthropic's cloud
- *      at `${CONTAINER_URL}/mcp/<connectorId>` (Bearer APIFY_TOKEN) and
- *      forwards to `${APIFY_MCP_PROXY_URL}/<connectorId>`.
- *   3. Build the per-run MCP server list:
- *        - https://mcp.apify.com/ (always — passed directly to Anthropic)
- *        - ${CONTAINER_URL}/mcp/<id> for each requested connector
- *   4. Clone the developer's template Agent, overriding mcp_servers.
- *   5. Create a vault + one static_bearer credential per MCP URL (APIFY_TOKEN).
- *   6. Reuse a cached Environment (per-Actor named KV store) or create one.
- *   7. Create a Session, send the user prompt, poll until idle.
- *   8. Fetch the final agent text, push to Dataset + KV OUTPUT.
- *   9. Cleanup: delete the vault, archive the cloned Agent, stop the proxy.
+ * Two modes (selected by env var `MCP_PROXY_ONLY`):
+ *
+ * 1. Normal mode (default) — runs the full Claude Managed Agent flow:
+ *      a. Validate input + required env vars.
+ *      b. If any MCP Connectors were requested, start a local MCP proxy on the
+ *         Actor's web server port. The proxy is reachable from Anthropic's cloud
+ *         at `${CONTAINER_URL}/mcp/<connectorId>` (Bearer APIFY_TOKEN) and
+ *         forwards to `${APIFY_MCP_PROXY_URL}/<connectorId>`.
+ *      c. Build the per-run MCP server list (mcp.apify.com + container-url proxies).
+ *      d. Clone the developer's template Agent, overriding mcp_servers.
+ *      e. Create a vault + one static_bearer credential per MCP URL.
+ *      f. Reuse a cached Environment or create one.
+ *      g. Create a Session, send the user prompt, poll until idle.
+ *      h. Fetch the final agent text, push to Dataset + KV OUTPUT.
+ *      i. Cleanup: delete the vault, archive the cloned Agent, stop the proxy.
+ *
+ * 2. Proxy-only mode (`MCP_PROXY_ONLY=1`) — boots only the local MCP proxy and
+ *    blocks until aborted. Lets you point a local MCP client at
+ *    `http://localhost:<ACTOR_WEB_SERVER_PORT>/mcp/<connectorId>` (Bearer APIFY_TOKEN)
+ *    to test the proxy + upstream Apify MCP Proxy round-trip without spinning up
+ *    the Anthropic Managed Agent.
  */
 
 import { Actor, log } from 'apify';
@@ -62,9 +68,12 @@ function formatEventForLog(event: SessionEvent): string | null {
 interface ActorInput {
     prompt: string;
     mcpConnectors?: string[];
+    /** Hidden debug toggle — boots only the local MCP proxy, skips the Claude agent. */
+    mcpProxyOnly?: boolean;
 }
 
 interface ProcessedInputs {
+    mcpProxyOnly: boolean;
     prompt: string;
     mcpConnectors: string[];
     apiKey: string;
@@ -85,16 +94,38 @@ interface ActorResult {
 const CONNECTOR_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 /**
+ * Boots the local MCP proxy and returns its handle plus the public base URL.
+ * Used by BOTH the full agent flow (Anthropic's cloud agent calls into the
+ * proxy via the container URL) AND the proxy-only debug mode.
+ */
+async function startMcpProxy(apifyToken: string): Promise<{ server: StartedServer; baseUrl: string }> {
+    const apifyMcpProxyBaseUrl = process.env.APIFY_MCP_PROXY_URL!;
+    const containerUrl = process.env.APIFY_CONTAINER_URL!.replace(/\/$/, '');
+    const serverPort = Number(process.env.ACTOR_WEB_SERVER_PORT) || 4321;
+    const server = await startServer({ serverPort, apifyMcpProxyBaseUrl, apifyToken });
+    return { server, baseUrl: `${containerUrl}/mcp` };
+}
+
+/** Resolve when the platform signals abort/migrate or the OS signals SIGINT/SIGTERM. */
+function waitForShutdownSignal(): Promise<void> {
+    return new Promise((resolve) => {
+        const stop = () => resolve();
+        Actor.on('aborting', stop);
+        Actor.on('migrating', stop);
+        process.once('SIGINT', stop);
+        process.once('SIGTERM', stop);
+    });
+}
+
+/**
  * Reads + validates Actor input and developer env vars. Fails fast (via
  * `Actor.fail`) on any user-facing error so the run shows a clear status
  * message in the Console. Apify-injected env vars are trusted as present.
  */
 async function processInputs(): Promise<ProcessedInputs> {
     const raw = ((await Actor.getInput<ActorInput>()) ?? {}) as Partial<ActorInput>;
+    const mcpProxyOnly = raw.mcpProxyOnly === true;
 
-    if (typeof raw.prompt !== 'string' || !raw.prompt.trim()) {
-        await failAndExit('Missing required input "prompt" (non-empty string).');
-    }
     const mcpConnectors = raw.mcpConnectors ?? [];
     if (!Array.isArray(mcpConnectors) || mcpConnectors.some((id) => typeof id !== 'string')) {
         await failAndExit('"mcpConnectors" must be an array of connector ID strings.');
@@ -106,16 +137,22 @@ async function processInputs(): Promise<ProcessedInputs> {
         await failAndExit(`Invalid connector ID "${badId}" — expected /^[A-Za-z0-9_-]+$/.`);
     }
 
-    // Anthropic credentials are developer-provided (not Apify-managed) — verify them.
-    for (const v of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AGENT_ID'] as const) {
-        if (!process.env[v]) await failAndExit(`Missing required env var: ${v}`);
+    // Prompt + Anthropic credentials are only required for the normal agent flow.
+    if (!mcpProxyOnly) {
+        if (typeof raw.prompt !== 'string' || !raw.prompt.trim()) {
+            await failAndExit('Missing required input "prompt" (non-empty string).');
+        }
+        for (const v of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AGENT_ID'] as const) {
+            if (!process.env[v]) await failAndExit(`Missing required env var: ${v}`);
+        }
     }
 
     return {
-        prompt: raw.prompt!,
+        mcpProxyOnly,
+        prompt: raw.prompt ?? '',
         mcpConnectors,
-        apiKey: process.env.ANTHROPIC_API_KEY!,
-        templateAgentId: process.env.ANTHROPIC_AGENT_ID!,
+        apiKey: process.env.ANTHROPIC_API_KEY ?? '',
+        templateAgentId: process.env.ANTHROPIC_AGENT_ID ?? '',
         apifyToken: process.env.APIFY_TOKEN!,
         runId: process.env.APIFY_ACTOR_RUN_ID || `local-${Date.now()}`,
     };
@@ -127,17 +164,62 @@ const startedAt = Date.now();
 const cleanupRefs: CleanupRefs = {};
 let proxyServer: StartedServer | null = null;
 
+// Stop the proxy FIRST so Anthropic's last in-flight calls cannot reach the
+// upstream Apify MCP Proxy after we revoke the vault credentials below.
+async function cleanupAll(): Promise<void> {
+    if (proxyServer) {
+        await proxyServer.close().catch((error) => {
+            log.warning('Failed to stop MCP proxy server (non-fatal)', { error: (error as Error).message });
+        });
+    }
+    if (process.env.ANTHROPIC_API_KEY && (cleanupRefs.vault || cleanupRefs.agent)) {
+        await cleanup(process.env.ANTHROPIC_API_KEY, cleanupRefs, log).catch((error) => {
+            log.warning('Cleanup threw unexpectedly (non-fatal)', { error: (error as Error).message });
+        });
+    }
+}
+
 try {
-    const { prompt, mcpConnectors, apiKey, templateAgentId, apifyToken, runId } = await processInputs();
+    const inputs = await processInputs();
+
+    if (inputs.mcpProxyOnly) {
+        const { apifyToken, mcpConnectors } = inputs;
+        const { server, baseUrl } = await startMcpProxy(apifyToken);
+        proxyServer = server;
+
+        log.info('mcpProxyOnly=true — Anthropic flow skipped. MCP proxy is up.');
+        log.info('Connect with Bearer $APIFY_TOKEN to:');
+        if (mcpConnectors.length === 0) {
+            log.info(`  ${baseUrl}/<connectorId>   (no mcpConnectors in input)`);
+        } else {
+            for (const id of mcpConnectors) {
+                log.info(`  ${baseUrl}/${id}`);
+            }
+        }
+        log.info('Waiting for shutdown signal (SIGINT / SIGTERM / Apify abort)…');
+        await waitForShutdownSignal();
+        log.info('Shutdown signal received; stopping proxy.');
+    } else {
+        await runAgentJob(inputs);
+    }
+
+    await cleanupAll();
+    await Actor.exit();
+} catch (err) {
+    const e = err as { message?: string; status?: number; body?: unknown };
+    log.error('Actor failed:', { error: e.message, status: e.status, body: e.body });
+    await cleanupAll();
+    await Actor.fail(e.message ?? 'Actor failed');
+}
+
+async function runAgentJob(inputs: ProcessedInputs): Promise<void> {
+    const { prompt, mcpConnectors, apiKey, templateAgentId, apifyToken, runId } = inputs;
 
     let connectorBaseUrl: string | null = null;
     if (mcpConnectors.length > 0) {
-        const apifyMcpProxyBaseUrl = process.env.APIFY_MCP_PROXY_URL!;
-        const containerUrl = process.env.APIFY_CONTAINER_URL!;
-        const serverPort = Number(process.env.ACTOR_WEB_SERVER_PORT);
-
-        proxyServer = await startServer({ serverPort, apifyMcpProxyBaseUrl, apifyToken });
-        connectorBaseUrl = `${containerUrl.replace(/\/$/, '')}/mcp`;
+        const { server, baseUrl } = await startMcpProxy(apifyToken);
+        proxyServer = server;
+        connectorBaseUrl = baseUrl;
     }
 
     const mcpServers: McpServer[] = [
@@ -213,25 +295,4 @@ try {
     await Actor.pushData(result);
     await Actor.setValue('OUTPUT', result);
     log.info(`Done in ${result.durationMs} ms (${answer.length} chars of answer).`);
-} catch (err) {
-    const e = err as { message?: string; status?: number; body?: unknown };
-    log.error('Actor failed:', { error: e.message, status: e.status, body: e.body });
-    exitCode = 1;
-    // Surface the failure reason on the run's status line in Apify Console.
-    await Actor.exit(e.message ?? 'Actor failed', { exitCode: 1 });
-} finally {
-    // Stop the proxy FIRST so Anthropic's last in-flight calls cannot reach
-    // the upstream Apify MCP Proxy after we revoke the vault credentials
-    // below.
-    if (proxyServer) {
-        await proxyServer.close().catch((error) => {
-            log.warning('Failed to stop MCP proxy server (non-fatal)', { error: (error as Error).message });
-        });
-    }
-    if (process.env.ANTHROPIC_API_KEY && (cleanupRefs.vault || cleanupRefs.agent)) {
-        await cleanup(process.env.ANTHROPIC_API_KEY, cleanupRefs, log).catch((error) => {
-            log.warning('Cleanup threw unexpectedly (non-fatal)', { error: (error as Error).message });
-        });
-    }
-    await Actor.exit( 'Actor finished');
 }
