@@ -34,17 +34,9 @@ Single row written to the default Dataset + `OUTPUT` key-value store:
 
 ```json
 {
-  "prompt": "...",
   "answer": "...",
-  "mcpConnectors": ["slack", "notion"],
-  "mcpServerUrls": [
-    "https://mcp.apify.com/",
-    "https://connectors-proxy.apify.run/?name=slack",
-    "https://connectors-proxy.apify.run/?name=notion"
-  ],
-  "sessionId": "sesn_...",
   "agentId": "agent_...",
-  "templateAgentId": "agent_...",
+  "sessionId": "sesn_...",
   "environmentId": "env_...",
   "durationMs": 87432,
   "finishedAt": "2026-05-25T13:42:11.234Z"

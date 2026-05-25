@@ -1,0 +1,5 @@
+# pnpm 11 config (must live here — package.json#pnpm is no longer read).
+# https://pnpm.io/11.x/migration
+
+allowBuilds:
+  esbuild: true

@@ -1,0 +1,22 @@
+{
+    "title": "Claude Agent input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "prompt": {
+            "title": "Task / prompt",
+            "type": "string",
+            "editor": "textarea",
+            "description": "What should the Claude agent do? The agent will have access to mcp.apify.com (Apify Store) plus any MCP connectors you select below.",
+            "example": "Scrape the National Geographic Instagram profile and summarize the latest 5 posts."
+        },
+        "mcpConnectors": {
+            "title": "MCP Connectors",
+            "type": "array",
+	    "resourceType": "mcpConnector",
+            "description": "Apify MCP connector IDs (e.g. 'slack', 'notion'). Each ID becomes an MCP server at https://connectors-proxy.apify.run/?name=<id> wired to your APIFY_TOKEN.",
+	    "mcpServers": [{ "url": "*" }]
+        }
+    },
+    "required": ["prompt"]
+}
