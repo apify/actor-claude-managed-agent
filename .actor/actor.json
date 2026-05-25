@@ -2,32 +2,18 @@
     "actorSpecification": 1,
     "name": "claude-agent",
     "title": "Claude Agent with MCP Connectors",
-    "description": "Run a Claude Managed Agent on Apify with user-selected MCP connectors. Clones a developer-defined template Agent at runtime and wires in mcp.apify.com plus any requested Apify connectors.",
+    "description": "Run a Claude Managed Agent on Apify with user-selected MCP connectors. Clones a developer-defined template Agent at runtime and wires in mcp.apify.com plus any requested Apify connectors via a local MCP proxy.",
     "version": "0.0",
     "buildTag": "latest",
+    "meta": {
+        "templateId": "ts-claude-managed-agent",
+        "generatedBy": "Claude Code with Claude Opus 4.7"
+    },
     "input": "./input_schema.json",
-    "dockerfile": "./Dockerfile",
-    "categories": ["AI"],
+    "output": "./output_schema.json",
     "storages": {
-        "dataset": {
-            "actorSpecification": 1,
-            "title": "Agent task results",
-            "views": {
-                "overview": {
-                    "title": "Overview",
-                    "display": {
-                        "component": "table",
-                        "properties": {
-                            "answer":        { "label": "Answer",         "format": "text" },
-                            "agentId":       { "label": "Agent ID",       "format": "text" },
-                            "sessionId":     { "label": "Session ID",     "format": "text" },
-                            "environmentId": { "label": "Environment ID", "format": "text" },
-                            "durationMs":    { "label": "Duration (ms)",  "format": "number" },
-                            "finishedAt":    { "label": "Finished At",    "format": "date" }
-                        }
-                    }
-                }
-            }
-        }
-    }
+        "dataset": "./dataset_schema.json"
+    },
+    "dockerfile": "./Dockerfile",
+    "categories": ["AI"]
 }

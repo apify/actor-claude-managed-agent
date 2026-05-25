@@ -7,3 +7,4 @@ apify_storage
 .env.local
 .DS_Store
 *.log
+.idea
