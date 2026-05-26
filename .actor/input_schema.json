@@ -7,16 +7,23 @@
             "title": "Task / prompt",
             "type": "string",
             "editor": "textarea",
-            "description": "What should the Claude agent do? The agent will have access to mcp.apify.com (Apify Store) plus any MCP connectors you select below.",
+            "description": "What should the Claude agent do? The agent will have access to https://mcp.apify.com (Apify Store) plus any MCP Connectors you select below.",
             "example": "Scrape the National Geographic Instagram profile and summarize the latest 5 posts."
         },
         "mcpConnectors": {
             "title": "MCP Connectors",
             "type": "array",
-	    "resourceType": "mcpConnector",
-            "description": "Apify MCP connector IDs (e.g. 'slack', 'notion'). Each ID becomes an MCP server at https://connectors-proxy.apify.run/?name=<id> wired to your APIFY_TOKEN.",
-	    "mcpServers": [{ "url": "*" }]
+            "resourceType": "mcpConnector",
+            "description": "Apify MCP Connector IDs to expose to the agent. Each connector is re-published by this Actor at https://<container-url>/mcp/<connectorId> and forwarded to the documented Apify MCP Proxy. Create connectors under Settings → API & Integrations → MCP Connectors.",
+            "mcpServers": [{ "url": "*" }]
+        },
+        "mcpProxyOnly": {
+            "title": "MCP proxy only (debug)",
+            "type": "boolean",
+            "editor": "hidden",
+            "description": "If true, boot only the local MCP proxy and skip the Claude Managed Agent flow. The run stays alive until aborted so you can point an external MCP client at the container URL.",
+            "default": false
         }
     },
-    "required": ["prompt"]
+    "required": []
 }

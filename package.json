@@ -16,9 +16,12 @@
         "clean": "rm -rf dist"
     },
     "dependencies": {
-        "apify": "^3.5.0"
+        "@modelcontextprotocol/sdk": "^1.17.5",
+        "apify": "^3.5.0",
+        "express": "^5.1.0"
     },
     "devDependencies": {
+        "@types/express": "^5.0.2",
         "@types/node": "24.12.3",
         "tsx": "4.21.0",
         "typescript": "5.9.3"
