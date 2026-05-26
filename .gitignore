@@ -1,0 +1,10 @@
+node_modules
+dist
+storage
+crawlee_storage
+apify_storage
+.env
+.env.local
+.DS_Store
+*.log
+.idea

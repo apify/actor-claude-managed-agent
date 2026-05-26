@@ -1,0 +1,30 @@
+{
+    "actorSpecification": 1,
+    "fields": {},
+    "views": {
+        "overview": {
+            "title": "Overview",
+            "transformation": {
+                "fields": [
+                    "answer",
+                    "agentId",
+                    "sessionId",
+                    "environmentId",
+                    "durationMs",
+                    "finishedAt"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "answer":        { "label": "Answer",         "format": "text" },
+                    "agentId":       { "label": "Agent ID",       "format": "text" },
+                    "sessionId":     { "label": "Session ID",     "format": "text" },
+                    "environmentId": { "label": "Environment ID", "format": "text" },
+                    "durationMs":    { "label": "Duration (ms)",  "format": "number" },
+                    "finishedAt":    { "label": "Finished At",    "format": "date" }
+                }
+            }
+        }
+    }
+}

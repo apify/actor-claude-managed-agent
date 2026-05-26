@@ -1,0 +1,29 @@
+{
+    "name": "claude-agent-actor",
+    "version": "0.0.1",
+    "type": "module",
+    "private": true,
+    "description": "Apify Actor that runs a Claude Managed Agent with dynamically-selected MCP connectors.",
+    "engines": {
+        "node": ">=24"
+    },
+    "packageManager": "pnpm@11.0.9",
+    "scripts": {
+        "build": "tsc",
+        "start": "node dist/main.js",
+        "start:dev": "tsx src/main.ts",
+        "typecheck": "tsc --noEmit",
+        "clean": "rm -rf dist"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.17.5",
+        "apify": "^3.5.0",
+        "express": "^5.1.0"
+    },
+    "devDependencies": {
+        "@types/express": "^5.0.2",
+        "@types/node": "24.12.3",
+        "tsx": "4.21.0",
+        "typescript": "5.9.3"
+    }
+}
