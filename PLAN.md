@@ -66,7 +66,7 @@ sequenceDiagram
         W-->>G: stream back
     end
     N-->>A: agent.message + session.status.idle (SSE)
-    A->>U: Actor.pushData({ answer })
+    A->>U: push answer to default dataset<br/>push transcript to "debug" dataset
     A->>N: DELETE /v1/vaults/{id}
     A->>A: exit 0
 ```
@@ -87,16 +87,16 @@ sequenceDiagram
 | # | Action | API / SDK |
 |---|---|---|
 | 1 | Read `Actor.getInput()` → `{ prompt }`. | Apify SDK |
-| 2 | Start HTTP server on `process.env.ACTOR_WEB_SERVER_PORT`, route `ALL /mcp`. URL is `process.env.ACTOR_WEB_SERVER_URL`. | Node `http` |
+| 2 | Start HTTP server on `process.env.ACTOR_WEB_SERVER_PORT`, route `ALL /mcp`. URL is `<ACTOR_WEB_SERVER_URL>/mcp`. | Node `http` |
 | 3 | Create vault. | `POST /v1/vaults` |
 | 4 | Add `static_bearer` credential: `mcp_server_url = <ACTOR_WEB_SERVER_URL>/mcp`, `token = APIFY_TOKEN`. | `POST /v1/vaults/{id}/credentials` |
 | 5 | Create session, pass `vault_ids = [<vault.id>]`. Status starts `idle`. | `POST /v1/sessions` |
 | 6 | Update session: `agent.mcp_servers = [{ type: "url", name: "apify", url: "<ACTOR_WEB_SERVER_URL>/mcp" }]`, `agent.tools` adds `mcp_toolset` for `"apify"`. Updates are session-local. | `POST /v1/sessions/{id}` |
-| 7 | Open SSE stream **before** sending the prompt (avoids dropped events). | `GET /v1/sessions/{id}/events/stream` |
+| 7 | Open SSE stream **before** sending the prompt (avoids dropped events). Collect events into an in-memory transcript as they arrive. | `GET /v1/sessions/{id}/events/stream` |
 | 8 | Send `user.message` event with the prompt. | `POST /v1/sessions/{id}/events` |
 | 9 | Consume stream until `session.status.idle` or `terminated`. | SSE consumer |
 | 10 | Extract text from the most recent `agent.message` event. | (in-stream) |
-| 11 | `Actor.pushData({ prompt, answer, sessionId })`. | Apify SDK |
+| 11 | `Actor.pushData({ prompt, answer, sessionId })` → default dataset. Open `Actor.openDataset('debug')` and push the full transcript (all events) → debug dataset. | Apify SDK |
 | 12 | Delete the vault. | `DELETE /v1/vaults/{id}` |
 | 13 | `process.exit(0)`. | — |
 
@@ -107,6 +107,20 @@ sequenceDiagram
 | a | Receive request from Anthropic agent runtime. `Authorization: Bearer APIFY_TOKEN` is injected by vault credential. | URL is "secret hard-to-guess", but the bearer adds defence-in-depth. |
 | b | Forward to `https://mcp.apify.com/mcp` (pass through method, body, headers). | Stateless reverse proxy. |
 | c | Stream response back. Apify MCP supports streamable HTTP. | — |
+
+## Confirmed decisions
+
+- **`/mcp` path:** mounted at `<ACTOR_WEB_SERVER_URL>/mcp`, not root. Leaves
+  room for other routes (health check, debug) without ambiguity.
+- **Input schema:** `{ prompt: string }` only. No `additional_instructions`
+  field for v1.
+- **Output:** two datasets.
+  - **default dataset** — one row per run: `{ prompt, answer, sessionId }`.
+  - **`debug` dataset** — one row per event observed during the run (tool
+    calls, thinking, agent.message, status changes). Useful for forkers
+    debugging their agent's behaviour without re-running. Cost: ~5 extra
+    LOC (`const debug = await Actor.openDataset('debug'); debug.pushData(ev)`
+    in the SSE loop).
 
 ## File layout
 
@@ -206,16 +220,6 @@ template.
 4. **`ACTOR_WEB_SERVER_PORT` default is 4321.** Make sure the HTTP server
    listens before any Anthropic API call (so by the time the agent tries to
    call `/mcp`, the server is up).
-
-## Open questions to confirm before coding
-
-1. Should the Actor expose `/mcp` at the **root** of the container URL or at
-   `/mcp`? (Recommendation: `/mcp`, so the path is explicit.)
-2. Should we add an optional `additional_instructions` input field that gets
-   appended to the user message? (Recommendation: skip for v1.)
-3. Should `Actor.pushData` include intermediate events (tool calls, thinking)
-   or just the final answer? (Recommendation: just the answer for v1, full
-   transcript behind a `verbose: true` input flag if useful.)
 
 ## Sources
 
