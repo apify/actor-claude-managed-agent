@@ -96,18 +96,18 @@ sequenceDiagram
 | # | Action | API / SDK |
 |---|---|---|
 | 1 | Read `Actor.getInput()` → `{ prompt, mcpConnectors: string[] }`. | Apify SDK |
-| 2 | Read `process.env.APIFY_MCP_PROXY_URL` and `process.env.ACTOR_RUN_API_TOKEN`. | Apify runtime env |
+| 2 | Read `process.env.APIFY_MCP_PROXY_URL`, `process.env.ACTOR_RUN_API_TOKEN`, and `process.env.ACTOR_TIMEOUT_AT` (run deadline as ISO timestamp). | Apify runtime env |
 | 3 | Create a vault. | `POST /v1/vaults` |
 | 4 | For each `connectorId` in input, add a credential of Anthropic type `static_bearer` carrying the Apify run token: `mcp_server_url = ${APIFY_MCP_PROXY_URL}/connection/${connectorId}`, `token = <Apify run token>`. | `POST /v1/vaults/{id}/credentials` |
 | 5 | Create the session, pass `vault_ids = [vault.id]`. Status starts `idle`. | `POST /v1/sessions` |
 | 6 | **If `mcpConnectors` is non-empty:** update the session — `agent.mcp_servers = [{ type: "url", name: connectorId, url: "<proxy URL above>" }, …]`, `agent.tools = [{ type: "agent_toolset_20260401" }, { type: "mcp_toolset", mcp_server_name: connectorId }, …]`. **If empty:** skip this step — the agent uses whatever `mcp_servers` are baked into its own definition. | `POST /v1/sessions/{id}` |
 | 7 | Open SSE stream **before** sending the prompt (avoids dropped events). Collect events into a transcript as they arrive. | `GET /v1/sessions/{id}/events/stream` |
 | 8 | Send `user.message` event with the prompt. | `POST /v1/sessions/{id}/events` |
-| 9 | Consume stream until `session.status.idle` or `terminated`. | SSE consumer |
+| 9 | Consume stream until `session.status.idle` or `terminated`, bounded by the agent deadline (see Failure handling). | SSE consumer |
 | 10 | Extract text from the most recent `agent.message` event. | (in-stream) |
 | 11 | Push final answer to default dataset; push one row per observed event to `debug` dataset. | `Actor.pushData` / `Actor.openDataset('debug')` |
-| 12 | Delete the vault. | `DELETE /v1/vaults/{id}` |
-| 13 | `process.exit(0)`. | — |
+| 12 | Delete the vault (best-effort, runs in `finally`). | `DELETE /v1/vaults/{id}` |
+| 13 | `process.exit(0)` (or non-zero on failure — see Failure handling). | — |
 
 There is **no `/mcp` handler** in the Actor. The Anthropic agent talks to the
 Apify MCP Proxy directly using the Apify run token that the vault injects.
@@ -144,11 +144,17 @@ additional MCP servers injected.
 
 Two datasets per run.
 
-**default** — one row, the final answer:
+**default** — one row per run:
 
 ```jsonc
-{ "prompt": "...", "answer": "...", "sessionId": "ses_..." }
+{ "prompt": "...", "answer": "...", "sessionId": "ses_...",
+  "error": null, "partial": false }
 ```
+
+On success, `error` is `null` and `partial` is `false`. On failure, `error`
+is a short string (`"timeout"`, `"session_terminated"`, `"stream_dropped"`,
+`"setup_failed"`, …) and `partial` is `true` if `answer` contains text
+extracted from a partial `agent.message` event.
 
 **debug** — one row per event observed on the SSE stream (`agent.thinking`,
 `agent.tool_use`, `agent.mcp_tool_use`, `agent.message`, status changes, …):
@@ -161,7 +167,8 @@ Two datasets per run.
 
 ```
 src/
-  main.ts          ~80  LOC   input -> vault -> session -> stream -> datasets -> exit
+  main.ts          ~125 LOC   input -> vault -> session -> stream -> datasets -> exit
+                              (includes ~45 LOC of failure handling)
   anthropic.ts     ~60  LOC   thin SDK wrappers (createVault, createSession, updateSession, stream, deleteVault)
 scripts/
   provision.ts     ~50  LOC   developer setup (see below)
@@ -190,9 +197,10 @@ The Actor runtime never calls `/v1/agents` or `/v1/environments`.
 - **Actor's request-path role:** none. The Anthropic agent talks to the
   Apify MCP Proxy directly. The Actor only orchestrates the Anthropic session.
 - **Input shape:** `{ prompt, mcpConnectors }`. No `additional_instructions`
-  field for v1.
-- **Output:** two datasets — default (final answer) + `debug` (one row per
-  event).
+  field for v1. No `timeoutSeconds` field — we read the Actor run's own
+  deadline from the runtime env (see Failure handling).
+- **Output:** two datasets — default (final answer or error) + `debug` (one
+  row per event).
 - **Auth token handed to Anthropic:** the Apify run token
   (`ACTOR_RUN_API_TOKEN`). Expires when the run ends.
 - **`APIFY_MCP_PROXY_URL` is static.** Verified against
@@ -220,6 +228,37 @@ The Actor runtime never calls `/v1/agents` or `/v1/environments`.
 - **`mcp_server_url` must byte-match** between the vault credential (step 4)
   and the session's `mcp_servers` entry (step 6). Construct both from the
   same template string to guarantee.
+
+## Failure handling
+
+**Where it can fail.** Three buckets. *Setup failures* — vault create,
+credential add, session create, session update, sending `user.message` —
+typically caused by auth or network issues, and abort the run before any
+useful work happens. *Stream failures* — the SSE stream drops mid-run, the
+session reaches `terminated`, or we hit the agent's hard deadline (see
+below). *Cleanup failures* — `DELETE /v1/vaults` fails after the run is
+done. The first two are fatal; the third is non-fatal and just logs a
+warning, since the vault's only secret is the Apify run token, which has
+already expired.
+
+**What we do about it.** The main flow runs inside `try` / `finally`. The
+`finally` always attempts vault deletion. On any fatal failure we (a) push
+all events collected so far to the `debug` dataset, (b) push a single row
+to the default dataset with `error` set to a short code and `answer` set to
+the text of the last `agent.message` we saw — if any — with `partial: true`,
+and (c) exit non-zero so Apify marks the run FAILED.
+
+**Agent deadline = Actor deadline − offset.** The end user sets the Actor's
+run timeout in the Apify Console (or via API). We read it from
+`process.env.ACTOR_TIMEOUT_AT` (ISO timestamp) and compute the agent's hard
+deadline as that timestamp minus a small offset (~30 seconds). The offset
+reserves time to push to both datasets, delete the vault, and exit cleanly
+before Apify hard-kills the container. If the agent hasn't reached `idle`
+by the computed deadline, the stream consumer stops, emits
+`error: "timeout"`, and runs the failure path above.
+
+Out of scope for v1: SSE reconnect on drop, retry on 429, resumable runs.
+If they become real problems, we add them later.
 
 ## Alternatives considered
 
@@ -283,14 +322,6 @@ complexity for v1.
 
 ## To resolve before implementation
 
-These two questions are deliberately not answered yet — we need a focused
-discussion before coding.
-
-- **Failure handling.** The plan covers the happy path only. We need to
-  decide what to do when the session goes `terminated`, when vault create
-  fails mid-run, when a connector ID is rejected by the proxy at
-  `initialize`, when the SSE stream drops. A short subsection once we agree
-  on the policy.
 - **`agent.tools` replacement in step 6.** Today the step writes a fresh
   `tools` array, which would wipe any custom tools the developer enabled on
   their agent (extra `agent_toolset` configs, skills, custom tools). We
