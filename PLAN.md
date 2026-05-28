@@ -3,17 +3,27 @@
 ## What we're building
 
 A minimal Apify Actor template that lets a developer publish their existing
-Claude Managed Agent to the Apify marketplace.
+Claude Managed Agent to the Apify marketplace, with the agent's toolbox wired
+to **Apify MCP Connectors** — Slack, Notion, GitHub and any other MCP server
+the end user has authorized in their Apify account.
 
-The Actor does two things, nothing else:
+The Actor does one thing: it forwards a prompt to the agent and returns the
+answer. The agent talks to the Apify MCP Proxy directly — the Actor is **not**
+in the request path for tool calls.
 
-1. **Forwards a prompt** from the Apify end user to a pre-existing Managed Agent
-   on Anthropic's side and returns the answer.
-2. **Exposes the Apify MCP server** as the agent's toolbox, so the agent can
-   call any Apify Actor as a tool, using the run-scoped Apify token.
+Target size: ~120 LOC. Forking + publishing should take ~5 minutes.
 
-Target size: under 300 LOC. Forking + publishing should take a developer ~5
-minutes.
+## Why this is simple
+
+The Apify MCP Proxy already handles every hard part:
+- Stores user credentials encrypted (OAuth, API keys, PATs).
+- Injects credentials into upstream MCP requests at runtime.
+- Enforces a per-connection tool ceiling and a per-Actor tool ceiling.
+- Validates that the calling Actor run is authorized to use each connection.
+- Closes sessions automatically when the Actor run ends.
+
+The Actor template just plugs the Anthropic agent into that machinery via
+the agent's `mcp_servers`. No HTTP server in the Actor. No `/mcp` proxy code.
 
 ## Architecture
 
@@ -21,21 +31,20 @@ minutes.
 flowchart LR
     User["End user<br/>(Apify Console)"]
     Apify["Apify platform"]
-    Actor["Actor container<br/>(Normal-mode run)<br/>HTTP server on /mcp"]
+    Actor["Actor process<br/>(orchestrator only)"]
     AnthropicAPI["Anthropic<br/>Managed Agents API"]
     AgentRT["Agent runtime<br/>(Anthropic cloud container)"]
-    ApifyMCP["mcp.apify.com<br/>(Apify MCP server)"]
-    Tools["Apify Actors<br/>(used as tools)"]
+    Proxy["Apify MCP Proxy<br/>APIFY_MCP_PROXY_URL"]
+    Up["e.g. Slack / Notion / GitHub"]
 
-    User -- "1. prompt" --> Apify
-    Apify -- "spawn run<br/>inject APIFY_TOKEN" --> Actor
-    Actor -- "2. create vault + session<br/>+ stream events" --> AnthropicAPI
-    AnthropicAPI -- "spin up" --> AgentRT
-    AgentRT -- "3. tool calls<br/>Bearer = APIFY_TOKEN" --> Actor
-    Actor -- "4. proxy /mcp -> mcp.apify.com" --> ApifyMCP
-    ApifyMCP -- "exec" --> Tools
-    AgentRT -- "5. final answer event" --> Actor
-    Actor -- "6. push to dataset" --> Apify
+    User -- "{ prompt, mcpConnections }" --> Apify
+    Apify -- "spawn run<br/>inject ACTOR_RUN_API_TOKEN<br/>+ APIFY_MCP_PROXY_URL" --> Actor
+    Actor -- "create vault + session<br/>stream events" --> AnthropicAPI
+    AnthropicAPI --> AgentRT
+    AgentRT -- "Bearer ACTOR_RUN_API_TOKEN<br/>/connection/<id>" --> Proxy
+    Proxy -- "inject user creds" --> Up
+    AgentRT -- "agent.message events" --> Actor
+    Actor -- "answer + transcript" --> Apify
     Apify -- "result" --> User
 ```
 
@@ -46,27 +55,28 @@ sequenceDiagram
     autonumber
     participant U as End user
     participant A as Actor process
-    participant W as Actor /mcp server
     participant N as Anthropic API
     participant G as Agent runtime
-    participant M as mcp.apify.com
+    participant P as Apify MCP Proxy
+    participant X as Upstream MCP server
 
-    U->>A: Trigger run with { prompt }
-    A->>W: Start HTTP server on ACTOR_WEB_SERVER_PORT
-    A->>N: POST /v1/vaults (+ static_bearer credential)
+    U->>A: Trigger run with { prompt, mcpConnections: [id1, id2] }
+    A->>N: POST /v1/vaults (one static_bearer credential per connection)
     A->>N: POST /v1/sessions (agent, env, vault_ids)
-    A->>N: POST /v1/sessions/{id} (override mcp_servers)
+    A->>N: POST /v1/sessions/{id} (set mcp_servers = list of proxy URLs)
     A->>N: GET /v1/sessions/{id}/events/stream
     A->>N: POST /v1/sessions/{id}/events (user.message)
     N->>G: dispatch
-    loop tool calls during agent run
-        G->>W: POST /mcp (Bearer APIFY_TOKEN)
-        W->>M: forward to mcp.apify.com
-        M-->>W: tool result (stream)
-        W-->>G: stream back
+    loop tool calls
+        G->>P: initialize / tools/list / tools/call<br/>Bearer ACTOR_RUN_API_TOKEN
+        P->>P: validate connectionId in run input,<br/>inject user credentials
+        P->>X: forward
+        X-->>P: result
+        P-->>G: stream back
     end
     N-->>A: agent.message + session.status.idle (SSE)
-    A->>U: push answer to default dataset<br/>push transcript to "debug" dataset
+    A->>U: push answer to default dataset
+    A->>U: push transcript to debug dataset
     A->>N: DELETE /v1/vaults/{id}
     A->>A: exit 0
 ```
@@ -77,125 +87,141 @@ sequenceDiagram
 
 | # | Action | How |
 |---|---|---|
-| 0a | Create the Managed Agent on Anthropic's side (system prompt, model, skills). `mcp_servers` can be empty. | Anthropic Console or `scripts/provision.ts` |
+| 0a | Create the Managed Agent on Anthropic side (system prompt, model, skills). `mcp_servers` can be empty. | Anthropic Console or `scripts/provision.ts` |
 | 0b | Create one cloud Environment. | `POST /v1/environments` |
-| 0c | Set Actor secrets in Apify: `ANTHROPIC_API_KEY`, `ANTHROPIC_AGENT_ID`, `ANTHROPIC_ENVIRONMENT_ID`. | Apify Console |
+| 0c | Set Actor secrets: `ANTHROPIC_API_KEY`, `ANTHROPIC_AGENT_ID`, `ANTHROPIC_ENVIRONMENT_ID`. | Apify Console |
 | 0d | `apify push`. | Apify CLI |
 
 ### Per run (the Actor process)
 
 | # | Action | API / SDK |
 |---|---|---|
-| 1 | Read `Actor.getInput()` → `{ prompt }`. | Apify SDK |
-| 2 | Start HTTP server on `process.env.ACTOR_WEB_SERVER_PORT`, route `ALL /mcp`. URL is `<ACTOR_WEB_SERVER_URL>/mcp`. | Node `http` |
+| 1 | Read `Actor.getInput()` → `{ prompt, mcpConnections: string[] }`. | Apify SDK |
+| 2 | Read `process.env.APIFY_MCP_PROXY_URL` and `process.env.ACTOR_RUN_API_TOKEN`. | Apify runtime env |
 | 3 | Create vault. | `POST /v1/vaults` |
-| 4 | Add `static_bearer` credential: `mcp_server_url = <ACTOR_WEB_SERVER_URL>/mcp`, `token = APIFY_TOKEN`. | `POST /v1/vaults/{id}/credentials` |
-| 5 | Create session, pass `vault_ids = [<vault.id>]`. Status starts `idle`. | `POST /v1/sessions` |
-| 6 | Update session: `agent.mcp_servers = [{ type: "url", name: "apify", url: "<ACTOR_WEB_SERVER_URL>/mcp" }]`, `agent.tools` adds `mcp_toolset` for `"apify"`. Updates are session-local. | `POST /v1/sessions/{id}` |
-| 7 | Open SSE stream **before** sending the prompt (avoids dropped events). Collect events into an in-memory transcript as they arrive. | `GET /v1/sessions/{id}/events/stream` |
+| 4 | For each `connectionId` in input, add a `static_bearer` credential: `mcp_server_url = ${APIFY_MCP_PROXY_URL}/connection/${connectionId}`, `token = ACTOR_RUN_API_TOKEN`. | `POST /v1/vaults/{id}/credentials` |
+| 5 | Create session, pass `vault_ids = [vault.id]`. Status starts `idle`. | `POST /v1/sessions` |
+| 6 | Update session: `agent.mcp_servers = [{ type: "url", name: connectionId, url: "<proxy URL above>" }, …]`, `agent.tools = [{ type: "agent_toolset_20260401" }, { type: "mcp_toolset", mcp_server_name: connectionId }, …]`. | `POST /v1/sessions/{id}` |
+| 7 | Open SSE stream **before** sending the prompt (avoids dropped events). Collect events into a transcript as they arrive. | `GET /v1/sessions/{id}/events/stream` |
 | 8 | Send `user.message` event with the prompt. | `POST /v1/sessions/{id}/events` |
 | 9 | Consume stream until `session.status.idle` or `terminated`. | SSE consumer |
 | 10 | Extract text from the most recent `agent.message` event. | (in-stream) |
-| 11 | `Actor.pushData({ prompt, answer, sessionId })` → default dataset. Open `Actor.openDataset('debug')` and push the full transcript (all events) → debug dataset. | Apify SDK |
+| 11 | `Actor.pushData({ prompt, answer, sessionId })` → default dataset. Open `Actor.openDataset('debug')` and push the full transcript → debug dataset. | Apify SDK |
 | 12 | Delete the vault. | `DELETE /v1/vaults/{id}` |
 | 13 | `process.exit(0)`. | — |
 
-### `/mcp` handler (lives inside the Actor)
+There is **no `/mcp` handler** in the Actor. The Anthropic agent talks to the
+Apify MCP Proxy directly using the bearer token that the Anthropic vault
+injects.
 
-| # | Action | Notes |
-|---|---|---|
-| a | Receive request from Anthropic agent runtime. `Authorization: Bearer APIFY_TOKEN` is injected by vault credential. | URL is "secret hard-to-guess", but the bearer adds defence-in-depth. |
-| b | Forward to `https://mcp.apify.com/mcp` (pass through method, body, headers). | Stateless reverse proxy. |
-| c | Stream response back. Apify MCP supports streamable HTTP. | — |
+## Input schema
 
-## Confirmed decisions
+```jsonc
+{
+  "prompt": {
+    "title": "Prompt",
+    "type": "string",
+    "editor": "textarea",
+    "description": "What you want the agent to do."
+  },
+  "mcpConnections": {
+    "title": "MCP connectors",
+    "type": "array",
+    "resourceType": "mcpConnector",
+    "mcpServers": [{ "url": "*" }],
+    "description": "Connectors the agent can use. Create them in Settings → API & Integrations.",
+    "default": []
+  }
+}
+```
 
-- **`/mcp` path:** mounted at `<ACTOR_WEB_SERVER_URL>/mcp`, not root. Leaves
-  room for other routes (health check, debug) without ambiguity.
-- **Input schema:** `{ prompt: string }` only. No `additional_instructions`
-  field for v1.
-- **Output:** two datasets.
-  - **default dataset** — one row per run: `{ prompt, answer, sessionId }`.
-  - **`debug` dataset** — one row per event observed during the run (tool
-    calls, thinking, agent.message, status changes). Useful for forkers
-    debugging their agent's behaviour without re-running. Cost: ~5 extra
-    LOC (`const debug = await Actor.openDataset('debug'); debug.pushData(ev)`
-    in the SSE loop).
+`mcpServers: [{ url: "*" }]` keeps the Actor compatible with any user
+connector. A more restrictive Actor (e.g. Slack-only) can narrow this.
 
 ## File layout
 
 ```
 src/
-  main.ts          ~120 LOC   input -> server -> vault -> session -> stream -> dataset
-  mcp-proxy.ts     ~40  LOC   /mcp -> mcp.apify.com passthrough
-  anthropic.ts     ~80  LOC   thin SDK wrappers
+  main.ts          ~80  LOC   input -> vault -> session -> stream -> datasets -> exit
+  anthropic.ts     ~60  LOC   thin SDK wrappers (createVault, createSession, updateSession, stream, deleteVault)
 scripts/
-  provision.ts     ~50  LOC   developer runs once to create agent + environment
+  provision.ts     ~50  LOC   developer runs once: create agent + environment, print IDs
 .actor/
   actor.json
-  input_schema.json   { prompt: { type: "string", editor: "textarea" } }
-README.md          fork-and-push guide
+  input_schema.json
+README.md           fork-and-push guide
 ```
+
+## Confirmed decisions
+
+- **Run mode:** Normal (not Standby). One container per run, exits when done.
+- **Actor's request-path role:** none. The Anthropic agent talks to Apify MCP
+  Proxy directly. The Actor only orchestrates the Anthropic session.
+- **Input shape:** `{ prompt, mcpConnections }`. No `additional_instructions`
+  field for v1.
+- **Output:** two datasets — default (final answer) + `debug` (full transcript).
+- **Auth token to the proxy:** `ACTOR_RUN_API_TOKEN`. Expires when the run ends,
+  which is the security boundary we want.
 
 ## Important things to know
 
-- **Run mode is Normal, not Standby.** Each Actor run is a fresh container with
-  a unique URL (`https://<container-key>.runs.apify.net`) exposed as
-  `ACTOR_WEB_SERVER_URL`. The container exits when the agent run finishes.
-- **The Actor never creates or modifies the agent.** Agent is provisioned by
-  the developer up front. The Actor only touches vaults, sessions, events.
-- **Per-session MCP override is the key trick.** The agent's `mcp_servers` is
-  replaced on the freshly-created session (which starts `idle`) with the
-  run-specific URL before we send the first message.
-- **Auth flows transparently.** `APIFY_TOKEN` is run-scoped — it can only
-  access this run's resources. It travels: Apify run env → vault credential →
-  Anthropic injects into outgoing MCP calls → our `/mcp` proxies it to
-  `mcp.apify.com`. The end user pays for their own runs.
-- **Streaming, not polling.** SDK uses SSE (`GET /events/stream`). The existing
-  4 s polling loop is removed.
-- **Networking requirements on the Anthropic environment:** default
-  `unrestricted` works. With `limited`, the developer needs
-  `*.runs.apify.net` + `mcp.apify.com` in `allowed_hosts`.
+- **`ACTOR_RUN_API_TOKEN` is run-scoped.** It expires with the run. If
+  Anthropic's agent tries to call the proxy after the Actor exits, requests
+  fail with 401. That's why the Actor must stay alive while the agent runs —
+  done naturally by blocking on the SSE stream until `idle`.
+- **Proxy validates connection IDs against run input.** If a connector isn't
+  in the Actor's input array, the proxy rejects it. The input schema is the
+  security perimeter — picking the right `mcpServers` patterns there controls
+  what the agent can touch.
+- **Tool ceiling.** With `mcpServers: [{ url: "*" }]` we impose no Actor-level
+  ceiling. The connection's `allowedTools` and the OAuth scopes still apply.
+  A future v2 can expose tighter filters per connector type.
+- **Networking on the Anthropic environment.** Default `unrestricted` works.
+  With `limited`, the developer needs the MCP Proxy host in `allowed_hosts`
+  (e.g. `mcp-proxy.apify.com` — confirm exact host once deployed).
+- **`mcp_server_url` must byte-match** between the vault credential (step 4)
+  and the session's `mcp_servers` entry (step 6). Construct both from the
+  same template string to guarantee.
 
 ## What gets deleted from the current code
 
-- `src/server.ts` (session-tracking in-Actor HTTP gateway) — replaced by a much
-  simpler `/mcp` reverse proxy.
-- `cloneAgentWithDynamicMcp` in `src/anthropic.ts` — agent cloning is gone.
-- `waitForSessionIdle` polling loop — replaced by SSE.
-- The KV-store environment cache — environment ID is now a static secret.
-- `error` status check at `src/anthropic.ts:289` — that status doesn't exist;
-  correct values are `idle | running | rescheduling | terminated`.
+- `src/server.ts` — in-Actor HTTP gateway (~266 LOC). Gone.
+- `src/mcp.ts` — Apify MCP Proxy passthrough (~125 LOC). Gone.
+- `cloneAgentWithDynamicMcp` in `src/anthropic.ts` — agent cloning. Gone.
+- `waitForSessionIdle` polling loop. Replaced by SSE stream.
+- The KV-store environment cache. Environment ID is now a static secret.
+- `error` status check at `src/anthropic.ts:289` — documented statuses are
+  `idle | running | rescheduling | terminated`.
 
 ## Alternatives considered
 
-### A. Standby mode (Actor as long-running web server)
+### A. Actor as MCP host (`/mcp` proxy inside the container)
 
-**How:** Actor stays alive at a stable URL like `https://<slug>.apify.actor`.
-Agent's `mcp_servers` is baked in at agent-creation time.
+**How:** Run an HTTP server in the Actor container. Anthropic's agent calls
+`<container-url>/mcp/<id>`. Actor forwards to
+`${APIFY_MCP_PROXY_URL}/connection/<id>`.
 
-**Why not:** Couples the agent definition to a specific Actor slug. Developers
-who already built their agent have to recreate it. Cold-start latency is moot
-(agent runs take seconds-to-minutes anyway). Standby's strengths (warm,
-multi-turn) don't help this workload. Can be added later as opt-in.
+**Why not:** The Apify MCP Proxy already does credential injection, tool
+filtering, run-scoped validation, and session cleanup. Putting the Actor in
+front duplicates those checks and adds a hop. Easy to add later as opt-in if a
+forker needs a custom seam (logging, tool transformation).
 
-### B. Per-run agent cloning (current code)
+### B. Standby mode (Actor as long-running web server)
+
+**How:** Actor stays alive at a stable URL. Agent's `mcp_servers` is baked in
+at agent-creation time.
+
+**Why not:** Couples the agent definition to a specific Actor slug. Cold-start
+latency is moot (agent runs take seconds-to-minutes anyway). Standby's
+strengths (warm, multi-turn) don't help this workload. Can be added later as
+opt-in for advanced forkers.
+
+### C. Per-run agent cloning (current code)
 
 **How:** Clone the template agent each run with the run-specific MCP URL.
 
-**Why not:** Extra API calls, orphaned agents on crashes, and the docs
-explicitly support per-session `mcp_servers` update — which removes the need to
-clone. Simpler is better.
-
-### C. Direct Anthropic → `mcp.apify.com` (skip the Actor in the tool path)
-
-**How:** Put `mcp.apify.com` directly in the agent's `mcp_servers`. The Actor
-just launches the session and exits.
-
-**Why not:** Loses the Actor's role as the MCP exposure point. The user
-explicitly wants the Actor to expose MCP so it can act as a customisation
-seam (filtering, logging) later. Keeping `/mcp` in the Actor costs ~40 LOC
-and gives that option.
+**Why not:** Extra API calls, orphaned agents on crashes. The docs explicitly
+support per-session `mcp_servers` update — which removes the need to clone.
 
 ### D. Bootstrap-on-first-run (auto-provision agent at Actor startup)
 
@@ -203,23 +229,23 @@ and gives that option.
 agent + environment and persists IDs in the KV store.
 
 **Why not:** Race conditions on parallel boots, hidden side effects, complex
-runtime. A `scripts/provision.ts` the developer runs locally is clearer for a
-template.
+runtime. A `scripts/provision.ts` the developer runs locally is clearer.
 
 ## Risks
 
-1. **Anthropic's agent runtime must be able to reach `*.runs.apify.net`.**
-   Default unrestricted networking covers it. Document the `allowed_hosts`
-   list for developers who use `limited` networking.
-2. **`mcp_server_url` must be byte-identical** between the vault credential
-   (step 4) and the session's `mcp_servers` entry (step 6). Construct both
-   from the same `ACTOR_WEB_SERVER_URL` variable to guarantee.
-3. **MCP proxy must handle SSE.** The Apify MCP server uses streamable HTTP.
-   We need a proxy that doesn't buffer the full response. Plain `fetch` +
-   pipe-through works; we'll smoke-test before publishing.
-4. **`ACTOR_WEB_SERVER_PORT` default is 4321.** Make sure the HTTP server
-   listens before any Anthropic API call (so by the time the agent tries to
-   call `/mcp`, the server is up).
+1. **Anthropic agent runtime must reach the Apify MCP Proxy host.** Default
+   `unrestricted` networking covers it. Document the host name for developers
+   using `limited` networking.
+2. **The MCP Proxy is V1.** Most major OAuth providers (GitHub, Slack, Google,
+   Microsoft) currently need "user-provided OAuth client" setup. Notion + a
+   few others work with zero setup via DCR. Worth a section in the README so
+   forkers know which connectors are easy/hard to set up.
+3. **`mcp_server_url` byte-match** between vault credential and session
+   `mcp_servers` (see "Important things to know").
+4. **Schema naming convergence.** The user-facing connector doc and the proxy
+   internal spec use slightly different field names (`mcpConnector` vs
+   `mcpConnection`, `mcpServers` vs `mcp.serverUrls`). We'll follow the
+   user-facing doc and update if the names settle differently before launch.
 
 ## Sources
 
@@ -228,5 +254,5 @@ template.
 - Events and streaming (SSE) — https://platform.claude.com/docs/en/managed-agents/events-and-streaming
 - Vaults and `static_bearer` — https://platform.claude.com/docs/en/managed-agents/vaults
 - Environments — https://platform.claude.com/docs/en/managed-agents/environments
-- Apify container web server — https://docs.apify.com/platform/actors/development/programming-interface/container-web-server
-- Apify MCP server — https://docs.apify.com/platform/integrations/mcp
+- Apify MCP Connectors (user-facing draft) — provided in conversation context
+- Apify MCP Proxy spec — apify/apify-mcp-proxy `docs/mcp-proxy-and-connections.md`
