@@ -223,6 +223,30 @@ agent + environment and persists IDs in the KV store.
 **Why not:** Race conditions on parallel boots, hidden side effects, complex
 runtime. A `scripts/provision.ts` the developer runs locally is clearer.
 
+## Out of scope for v1
+
+**Agent writing back to Apify storage** (datasets, key-value stores, run
+metadata).
+
+Today the agent can only read via the connector picker; it cannot push items
+to the run's default dataset, set KV-store values, or update the run's status
+message. For an Actor that scrapes many items or wants to stream incremental
+output, this would be useful — but it is deliberately out of scope for v1.
+
+**The preferred future path** is for Apify to add these run-scoped write
+tools to `mcp.apify.com` (or the MCP Proxy). The Apify run token already
+scopes auth to the current run, so a single set of tools — `push_to_dataset`,
+`set_kv_value`, `set_status_message` — covers every Actor that uses this
+template, not just ours. When those tools ship, this template picks them up
+automatically: the agent already has access to Apify MCP via the user's
+connector, no template change needed.
+
+**The rejected alternative** is exposing an MCP server inside the Actor
+container itself. That puts the HTTP server we just removed back in, adds a
+second MCP destination the developer has to think about, and duplicates
+auth + lifecycle concerns that the MCP Proxy already solves. Not worth the
+complexity for v1.
+
 ## Risks
 
 1. **Anthropic agent runtime must reach the Apify MCP Proxy host.** Default
