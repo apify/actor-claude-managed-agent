@@ -150,27 +150,15 @@ README.md           fork-and-push guide
 - **Auth token handed to Anthropic:** the Apify run token
   (`ACTOR_RUN_API_TOKEN`). Expires when the run ends, which is the security
   boundary we want.
-
-## Open question — needs verification before implementation
-
-> **Is `APIFY_MCP_PROXY_URL` static (same for every Actor run) or dynamic
-> (changes per run)?**
->
-> Why it matters:
-> - **Static:** simple. URL can be hardcoded into the agent definition on
->   Anthropic's side if the developer wants, or always injected from env at
->   runtime. Either works.
-> - **Dynamic per run:** the agent definition cannot bake the URL in. We
->   **must** override `mcp_servers` per session (step 6 above) — which we
->   already do, so no code change. But the developer cannot configure the
->   agent's `mcp_servers` ahead of time.
->
-> Plan: we already inject the URL per session from `process.env.APIFY_MCP_PROXY_URL`,
-> so the implementation is the same either way. The answer only changes
-> documentation guidance for developers building the agent.
->
-> To verify, read `apify/apify-mcp-proxy` deployment config (`deploy/` dir and
-> any `.env.*` files) and the proxy spec for URL provisioning. See "Next" below.
+- **`APIFY_MCP_PROXY_URL` is static.** Verified against
+  `apify/apify-mcp-proxy` deploy config: single multi-tenant Kubernetes
+  service (`apify-mcp-proxy`, 2 replicas, multi-AZ in `apify-main`). The
+  proxy differentiates requests by the Apify run token (resolves
+  `runId`/`userId`) and the `/connection/<id>` path. The base URL is the
+  same in every Actor container.
+  Implication: the **full URL** `${APIFY_MCP_PROXY_URL}/connection/<id>`
+  still varies per run because the connection ID is per-run input, so we
+  keep the per-session `mcp_servers` override in step 6.
 
 ## Important things to know
 
@@ -260,3 +248,4 @@ runtime. A `scripts/provision.ts` the developer runs locally is clearer.
 - Environments — https://platform.claude.com/docs/en/managed-agents/environments
 - Apify MCP Connectors (user-facing draft) — provided in conversation context
 - Apify MCP Proxy spec — apify/apify-mcp-proxy `docs/mcp-proxy-and-connections.md`
+- Apify MCP Proxy deploy config — apify/apify-mcp-proxy `deploy/helm/values.yaml.gotmpl`
