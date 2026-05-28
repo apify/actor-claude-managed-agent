@@ -15,28 +15,19 @@ toolbox, streams the answer back, and exits. The agent talks to the Apify
 MCP Proxy directly — the Actor is **not** in the request path for tool
 calls.
 
-Target: ~120 LOC. Fork + push should take ~5 minutes.
-
 ## Glossary
 
-- **Claude Managed Agent** — Anthropic's hosted agent runtime. Developer
-  defines it once (system prompt, model, tools, MCP servers); the
-  Anthropic API spins up containers and runs the agent loop. Each
+- **Claude Managed Agent** — Anthropic's hosted agent runtime. Each
   invocation is a **session**.
-- **MCP connector** — pre-authorized credentials to a third-party MCP
-  server (Slack, Notion, GitHub, …), stored in the end user's Apify
-  account. Created once via Apify Console → Settings → Integrations.
-  Each connector has an ID like `conn_abc123`.
-- **Apify MCP Proxy** — multi-tenant Apify service at `APIFY_MCP_PROXY_URL`.
-  Routes per connector via `/connection/<connectorId>` and injects the
-  connector's stored credentials before forwarding upstream.
-- **vault** (Anthropic concept) — a per-session bag of credentials, each
-  bound to a specific MCP server URL. Anthropic matches by URL and
-  injects the credential into the agent's outbound MCP calls.
-- **Apify run token** — the run-scoped Apify API token exposed inside the
-  Actor container as `ACTOR_RUN_API_TOKEN`. Expires when the run ends.
-  This is the token we hand to Anthropic via the vault. Anthropic's
-  credential type for it is `static_bearer`.
+- **MCP connector** — user-authorized credentials to a third-party MCP
+  server (Slack, Notion, …), stored in their Apify account. ID like
+  `conn_abc123`.
+- **Apify MCP Proxy** — multi-tenant service at `APIFY_MCP_PROXY_URL`;
+  routes per connector via `/connection/<id>`.
+- **vault** (Anthropic) — per-session bag of credentials matched to MCP
+  servers by URL.
+- **Apify run token** — `ACTOR_RUN_API_TOKEN`, run-scoped, expires with
+  the run. The bearer the agent uses for the proxy.
 
 ## Lifecycle (per run)
 
