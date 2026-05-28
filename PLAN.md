@@ -25,29 +25,6 @@ The Apify MCP Proxy already handles every hard part:
 The Actor template just plugs the Anthropic agent into that machinery via
 the agent's `mcp_servers`. No HTTP server in the Actor. No `/mcp` proxy code.
 
-## Architecture
-
-```mermaid
-flowchart LR
-    User["End user<br/>(Apify Console)"]
-    Apify["Apify platform"]
-    Actor["Actor process<br/>(orchestrator only)"]
-    AnthropicAPI["Anthropic<br/>Managed Agents API"]
-    AgentRT["Agent runtime<br/>(Anthropic cloud container)"]
-    Proxy["Apify MCP Proxy<br/>APIFY_MCP_PROXY_URL"]
-    Up["e.g. Slack / Notion / GitHub"]
-
-    User -- "{ prompt, mcpConnections }" --> Apify
-    Apify -- "spawn run<br/>inject ACTOR_RUN_API_TOKEN<br/>+ APIFY_MCP_PROXY_URL" --> Actor
-    Actor -- "create vault + session<br/>stream events" --> AnthropicAPI
-    AnthropicAPI --> AgentRT
-    AgentRT -- "Bearer ACTOR_RUN_API_TOKEN<br/>/connection/<id>" --> Proxy
-    Proxy -- "inject user creds" --> Up
-    AgentRT -- "agent.message events" --> Actor
-    Actor -- "answer + transcript" --> Apify
-    Apify -- "result" --> User
-```
-
 ## Lifecycle (per run)
 
 ```mermaid
@@ -61,14 +38,14 @@ sequenceDiagram
     participant X as Upstream MCP server
 
     U->>A: Trigger run with { prompt, mcpConnections: [id1, id2] }
-    A->>N: POST /v1/vaults (one static_bearer credential per connection)
+    A->>N: POST /v1/vaults (one credential per connection,<br/>token = Apify run token)
     A->>N: POST /v1/sessions (agent, env, vault_ids)
     A->>N: POST /v1/sessions/{id} (set mcp_servers = list of proxy URLs)
     A->>N: GET /v1/sessions/{id}/events/stream
     A->>N: POST /v1/sessions/{id}/events (user.message)
     N->>G: dispatch
     loop tool calls
-        G->>P: initialize / tools/list / tools/call<br/>Bearer ACTOR_RUN_API_TOKEN
+        G->>P: initialize / tools/list / tools/call<br/>Authorization: Bearer <Apify run token>
         P->>P: validate connectionId in run input,<br/>inject user credentials
         P->>X: forward
         X-->>P: result
@@ -80,6 +57,17 @@ sequenceDiagram
     A->>N: DELETE /v1/vaults/{id}
     A->>A: exit 0
 ```
+
+### Glossary
+
+- **Apify run token** — the run-scoped Apify API token injected into every
+  Actor container as `ACTOR_RUN_API_TOKEN`. Expires when the run ends. This is
+  the token we hand to Anthropic via the vault; Anthropic's Managed Agents
+  call this credential type `static_bearer`, but the value is always the
+  Apify run token.
+- **Apify MCP Proxy URL** — the base URL the agent calls. Exposed inside the
+  container as `APIFY_MCP_PROXY_URL`. Connector path is
+  `${APIFY_MCP_PROXY_URL}/connection/<connectionId>`.
 
 ## Step-by-step (with sources)
 
@@ -97,11 +85,11 @@ sequenceDiagram
 | # | Action | API / SDK |
 |---|---|---|
 | 1 | Read `Actor.getInput()` → `{ prompt, mcpConnections: string[] }`. | Apify SDK |
-| 2 | Read `process.env.APIFY_MCP_PROXY_URL` and `process.env.ACTOR_RUN_API_TOKEN`. | Apify runtime env |
-| 3 | Create vault. | `POST /v1/vaults` |
-| 4 | For each `connectionId` in input, add a `static_bearer` credential: `mcp_server_url = ${APIFY_MCP_PROXY_URL}/connection/${connectionId}`, `token = ACTOR_RUN_API_TOKEN`. | `POST /v1/vaults/{id}/credentials` |
-| 5 | Create session, pass `vault_ids = [vault.id]`. Status starts `idle`. | `POST /v1/sessions` |
-| 6 | Update session: `agent.mcp_servers = [{ type: "url", name: connectionId, url: "<proxy URL above>" }, …]`, `agent.tools = [{ type: "agent_toolset_20260401" }, { type: "mcp_toolset", mcp_server_name: connectionId }, …]`. | `POST /v1/sessions/{id}` |
+| 2 | Read `process.env.APIFY_MCP_PROXY_URL` and `process.env.ACTOR_RUN_API_TOKEN` (the Apify run token). | Apify runtime env |
+| 3 | Create a vault. | `POST /v1/vaults` |
+| 4 | For each `connectionId` in input, add a credential of Anthropic type `static_bearer` carrying the Apify run token: `mcp_server_url = ${APIFY_MCP_PROXY_URL}/connection/${connectionId}`, `token = <Apify run token>`. | `POST /v1/vaults/{id}/credentials` |
+| 5 | Create the session, pass `vault_ids = [vault.id]`. Status starts `idle`. | `POST /v1/sessions` |
+| 6 | Update the session: `agent.mcp_servers = [{ type: "url", name: connectionId, url: "<proxy URL above>" }, …]`, `agent.tools = [{ type: "agent_toolset_20260401" }, { type: "mcp_toolset", mcp_server_name: connectionId }, …]`. | `POST /v1/sessions/{id}` |
 | 7 | Open SSE stream **before** sending the prompt (avoids dropped events). Collect events into a transcript as they arrive. | `GET /v1/sessions/{id}/events/stream` |
 | 8 | Send `user.message` event with the prompt. | `POST /v1/sessions/{id}/events` |
 | 9 | Consume stream until `session.status.idle` or `terminated`. | SSE consumer |
@@ -111,8 +99,7 @@ sequenceDiagram
 | 13 | `process.exit(0)`. | — |
 
 There is **no `/mcp` handler** in the Actor. The Anthropic agent talks to the
-Apify MCP Proxy directly using the bearer token that the Anthropic vault
-injects.
+Apify MCP Proxy directly using the Apify run token that the vault injects.
 
 ## Input schema
 
@@ -160,12 +147,34 @@ README.md           fork-and-push guide
 - **Input shape:** `{ prompt, mcpConnections }`. No `additional_instructions`
   field for v1.
 - **Output:** two datasets — default (final answer) + `debug` (full transcript).
-- **Auth token to the proxy:** `ACTOR_RUN_API_TOKEN`. Expires when the run ends,
-  which is the security boundary we want.
+- **Auth token handed to Anthropic:** the Apify run token
+  (`ACTOR_RUN_API_TOKEN`). Expires when the run ends, which is the security
+  boundary we want.
+
+## Open question — needs verification before implementation
+
+> **Is `APIFY_MCP_PROXY_URL` static (same for every Actor run) or dynamic
+> (changes per run)?**
+>
+> Why it matters:
+> - **Static:** simple. URL can be hardcoded into the agent definition on
+>   Anthropic's side if the developer wants, or always injected from env at
+>   runtime. Either works.
+> - **Dynamic per run:** the agent definition cannot bake the URL in. We
+>   **must** override `mcp_servers` per session (step 6 above) — which we
+>   already do, so no code change. But the developer cannot configure the
+>   agent's `mcp_servers` ahead of time.
+>
+> Plan: we already inject the URL per session from `process.env.APIFY_MCP_PROXY_URL`,
+> so the implementation is the same either way. The answer only changes
+> documentation guidance for developers building the agent.
+>
+> To verify, read `apify/apify-mcp-proxy` deployment config (`deploy/` dir and
+> any `.env.*` files) and the proxy spec for URL provisioning. See "Next" below.
 
 ## Important things to know
 
-- **`ACTOR_RUN_API_TOKEN` is run-scoped.** It expires with the run. If
+- **The Apify run token is run-scoped.** It expires with the run. If
   Anthropic's agent tries to call the proxy after the Actor exits, requests
   fail with 401. That's why the Actor must stay alive while the agent runs —
   done naturally by blocking on the SSE stream until `idle`.
@@ -175,10 +184,8 @@ README.md           fork-and-push guide
   what the agent can touch.
 - **Tool ceiling.** With `mcpServers: [{ url: "*" }]` we impose no Actor-level
   ceiling. The connection's `allowedTools` and the OAuth scopes still apply.
-  A future v2 can expose tighter filters per connector type.
 - **Networking on the Anthropic environment.** Default `unrestricted` works.
-  With `limited`, the developer needs the MCP Proxy host in `allowed_hosts`
-  (e.g. `mcp-proxy.apify.com` — confirm exact host once deployed).
+  With `limited`, the developer needs the MCP Proxy host in `allowed_hosts`.
 - **`mcp_server_url` must byte-match** between the vault credential (step 4)
   and the session's `mcp_servers` entry (step 6). Construct both from the
   same template string to guarantee.
@@ -203,8 +210,7 @@ README.md           fork-and-push guide
 
 **Why not:** The Apify MCP Proxy already does credential injection, tool
 filtering, run-scoped validation, and session cleanup. Putting the Actor in
-front duplicates those checks and adds a hop. Easy to add later as opt-in if a
-forker needs a custom seam (logging, tool transformation).
+front duplicates those checks and adds a hop. Easy to add later as opt-in.
 
 ### B. Standby mode (Actor as long-running web server)
 
@@ -212,9 +218,7 @@ forker needs a custom seam (logging, tool transformation).
 at agent-creation time.
 
 **Why not:** Couples the agent definition to a specific Actor slug. Cold-start
-latency is moot (agent runs take seconds-to-minutes anyway). Standby's
-strengths (warm, multi-turn) don't help this workload. Can be added later as
-opt-in for advanced forkers.
+latency is moot (agent runs take seconds-to-minutes anyway).
 
 ### C. Per-run agent cloning (current code)
 
