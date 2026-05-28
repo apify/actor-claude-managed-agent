@@ -62,7 +62,7 @@ sequenceDiagram
     U->>A: Trigger run with { prompt, mcpConnectors: [id1, id2] }
     A->>N: POST /v1/vaults (one credential per connector,<br/>token = Apify run token)
     A->>N: POST /v1/sessions (agent, env, vault_ids)
-    A->>N: POST /v1/sessions/{id} (set mcp_servers = list of proxy URLs)
+    A->>N: POST /v1/sessions/{id} (set mcp_servers + mcp_toolset entries)
     A->>N: GET /v1/sessions/{id}/events/stream
     A->>N: POST /v1/sessions/{id}/events (user.message)
     N->>G: dispatch
@@ -86,7 +86,7 @@ sequenceDiagram
 
 | # | Action | How |
 |---|---|---|
-| 0a | Create the Managed Agent on Anthropic side (system prompt, model, skills). `mcp_servers` can be empty. | Anthropic Console or `scripts/provision.ts` |
+| 0a | Create the Managed Agent on Anthropic side (system prompt, model, skills). **`mcp_servers` must be empty** — the Actor injects them per session; any MCP server you configure on the agent will be ignored (and would fail at runtime anyway, see Important things to know). | Anthropic Console or `scripts/provision.ts` |
 | 0b | Create one cloud Environment. | `POST /v1/environments` |
 | 0c | Set Actor secrets: `ANTHROPIC_API_KEY`, `ANTHROPIC_AGENT_ID`, `ANTHROPIC_ENVIRONMENT_ID`. | Apify Console |
 | 0d | `apify push`. | Apify CLI |
@@ -100,7 +100,7 @@ sequenceDiagram
 | 3 | Create a vault. | `POST /v1/vaults` |
 | 4 | For each `connectorId` in input, add a credential of Anthropic type `static_bearer` carrying the Apify run token: `mcp_server_url = ${APIFY_MCP_PROXY_URL}/connection/${connectorId}`, `token = <Apify run token>`. | `POST /v1/vaults/{id}/credentials` |
 | 5 | Create the session, pass `vault_ids = [vault.id]`. Status starts `idle`. | `POST /v1/sessions` |
-| 6 | **If `mcpConnectors` is non-empty:** update the session — `agent.mcp_servers = [{ type: "url", name: connectorId, url: "<proxy URL above>" }, …]`, `agent.tools = [{ type: "agent_toolset_20260401" }, { type: "mcp_toolset", mcp_server_name: connectorId }, …]`. **If empty:** skip this step — the agent uses whatever `mcp_servers` are baked into its own definition. | `POST /v1/sessions/{id}` |
+| 6 | **If `mcpConnectors` is non-empty:** `GET /v1/sessions/{id}` to read the agent config inherited at session creation. Build the update by **replacing** `agent.mcp_servers` entirely with our proxy URLs, and **replacing only the `mcp_toolset` entries** in `agent.tools` with ours — everything else in `tools` (notably `agent_toolset_20260401`, skills, custom configs, permission policies) is preserved verbatim. Our `mcp_toolset` entries use `default_config: { permission_policy: { type: "always_allow" } }` because Actor runs are unattended. POST the updated agent block back. **If empty:** skip — the agent runs with its original (necessarily empty) `mcp_servers`. | `GET` + `POST /v1/sessions/{id}` |
 | 7 | Open SSE stream **before** sending the prompt (avoids dropped events). Collect events into a transcript as they arrive. | `GET /v1/sessions/{id}/events/stream` |
 | 8 | Send `user.message` event with the prompt. | `POST /v1/sessions/{id}/events` |
 | 9 | Consume stream until `session.status.idle` or `terminated`, bounded by the agent deadline (see Failure handling). | SSE consumer |
@@ -137,8 +137,8 @@ Apify MCP Proxy directly using the Apify run token that the vault injects.
 connector. A more restrictive Actor (e.g. Slack-only) can narrow this.
 
 If `mcpConnectors` is empty at run time, the Actor still runs — the agent
-uses whatever tools its Anthropic-side definition provides, with no
-additional MCP servers injected.
+runs without MCP servers and uses only its built-in tools (`agent_toolset`,
+skills).
 
 ## Output
 
@@ -210,9 +210,23 @@ The Actor runtime never calls `/v1/agents` or `/v1/environments`.
   `${APIFY_MCP_PROXY_URL}/connection/<id>` still varies per run because the
   connector ID is per-run input, so we keep the per-session `mcp_servers`
   override in step 6.
+- **MCP toolbox is owned by the Actor.** The developer's agent has empty
+  `mcp_servers`. Step 6 replaces `mcp_servers` and the `mcp_toolset`
+  entries in `tools` with ours; everything else in `tools` is preserved
+  verbatim (`agent_toolset_20260401`, skills, permission policies, custom
+  configs).
 
 ## Important things to know
 
+- **The developer's agent must have no MCP servers in its definition.** The
+  Actor injects MCP servers per session from input; any servers configured
+  on the agent itself would fail at runtime because the per-session vault
+  carries credentials only for the user's Apify connectors. Step 6
+  replaces `agent.mcp_servers` entirely. Skills, the built-in agent
+  toolset, and any custom permission policies are preserved.
+- **Permission policy on injected MCP tools is `always_allow`.** Actor runs
+  are unattended — there is no human to answer `always_ask` prompts. This
+  is a property of the deployment model, not a choice.
 - **The Apify run token is run-scoped.** It expires with the run. If
   Anthropic's agent tries to call the proxy after the Actor exits, requests
   fail with 401. That's why the Actor must stay alive while the agent runs —
@@ -295,6 +309,17 @@ agent + environment and persists IDs in the KV store.
 **Why not:** Race conditions on parallel boots, hidden side effects, complex
 runtime. A `scripts/provision.ts` the developer runs locally is clearer.
 
+### E. Merge developer-side `mcp_servers` with Actor-injected ones
+
+**How:** Keep whatever MCP servers the developer configured on the agent
+and append the user's Apify connectors at session-update time.
+
+**Why not:** The per-session vault we attach carries credentials only for
+the Apify connectors. Developer-side servers would call out unauthenticated
+and fail unless they don't require auth — rare in practice. The simpler
+contract ("MCP toolbox is owned by the Actor, agent has no MCP servers
+configured") avoids this footgun entirely.
+
 ## Out of scope for v1
 
 **Agent writing back to Apify storage** (datasets, key-value stores, run
@@ -319,13 +344,6 @@ container itself. That puts the HTTP server we just removed back in, adds a
 second MCP destination the developer has to think about, and duplicates
 auth + lifecycle concerns that the MCP Proxy already solves. Not worth the
 complexity for v1.
-
-## To resolve before implementation
-
-- **`agent.tools` replacement in step 6.** Today the step writes a fresh
-  `tools` array, which would wipe any custom tools the developer enabled on
-  their agent (extra `agent_toolset` configs, skills, custom tools). We
-  want to preserve them. Need a precise preserve-and-extend rule.
 
 ## Risks
 
