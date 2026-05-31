@@ -7,14 +7,14 @@
             "title": "Task / prompt",
             "type": "string",
             "editor": "textarea",
-            "description": "What should the Claude agent do? The agent will have access to https://mcp.apify.com (Apify Store) plus any MCP Connectors you select below.",
-            "example": "Scrape the National Geographic Instagram profile and summarize the latest 5 posts."
+            "description": "What should the agent do? It can use any MCP connectors you select below.",
+            "example": "List the channels in my Slack workspace and summarize the most recent message in each."
         },
         "mcpConnectors": {
             "title": "MCP Connectors",
             "type": "array",
             "resourceType": "mcpConnector",
-            "description": "Apify MCP Connector IDs to expose to the agent. Each connector is re-published by this Actor at https://<container-url>/mcp/<connectorId> and forwarded to the documented Apify MCP Proxy. Create connectors under Settings → API & Integrations → MCP Connectors.",
+            "description": "Apify MCP Connector IDs to expose to the agent as tools. Each is served by this Actor at <container-url>/mcp/<connectorId> and forwarded to the Apify MCP Proxy, which injects your credentials. Leave empty to run the agent with only its built-in tools. Create connectors under Settings → Integrations → MCP Connectors.",
             "mcpServers": [{ "url": "*" }]
         },
         "mcpProxyOnly": {
