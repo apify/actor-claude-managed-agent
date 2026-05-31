@@ -39,7 +39,7 @@ interface FakeAnthropic {
  * session's mcp_servers, calls the `echo` tool, and streams the result back as
  * SSE `agent.message` + `session.status_idle`.
  */
-async function startFakeAnthropic(): Promise<FakeAnthropic> {
+async function startFakeAnthropic(opts: { failSessionCreate?: boolean } = {}): Promise<FakeAnthropic> {
     const app = express();
     app.use(express.json());
 
@@ -55,7 +55,13 @@ async function startFakeAnthropic(): Promise<FakeAnthropic> {
     });
     app.delete('/v1/vaults/:id', (_req, res) => { deletedVault = true; res.json({}); });
 
-    app.post('/v1/sessions', (_req, res) => res.json({ id: 'ses_e2e', status: 'idle' }));
+    app.post('/v1/sessions', (_req, res) => {
+        if (opts.failSessionCreate) {
+            res.status(400).json({ error: { message: 'invalid agent id' } });
+            return;
+        }
+        res.json({ id: 'ses_e2e', status: 'idle' });
+    });
     // session update — capture the injected mcp server URL
     app.post('/v1/sessions/:id', (req, res) => {
         const servers = req.body?.agent?.mcp_servers as Array<{ url: string }> | undefined;
@@ -213,5 +219,54 @@ describe('end-to-end Actor run', () => {
 
     it('deleted the vault during cleanup', () => {
         expect(anthropic.sawDeleteVault()).toBe(true);
+    });
+});
+
+describe('end-to-end Actor run — setup failure', () => {
+    let upstream: FakeUpstream;
+    let anthropic: FakeAnthropic;
+    let storageDir: string;
+    let result: ActorResult;
+
+    beforeAll(async () => {
+        upstream = await startFakeUpstream();
+        anthropic = await startFakeAnthropic({ failSessionCreate: true });
+        const actorPort = await freePort();
+        storageDir = await mkdtemp(join(tmpdir(), 'actor-e2e-fail-'));
+        const kvDir = join(storageDir, 'key_value_stores', 'default');
+        await mkdir(kvDir, { recursive: true });
+        await writeFile(join(kvDir, 'INPUT.json'), JSON.stringify({ prompt: 'x', mcpConnectors: ['conn_test'] }));
+
+        result = await runActor(
+            {
+                ANTHROPIC_BASE_URL: anthropic.baseUrl,
+                ANTHROPIC_API_KEY: 'sk-test',
+                ANTHROPIC_AGENT_ID: 'ag_bad',
+                ANTHROPIC_ENVIRONMENT_ID: 'env_test',
+                APIFY_MCP_PROXY_URL: upstream.baseUrl,
+                APIFY_CONTAINER_URL: `http://127.0.0.1:${actorPort}`,
+                ACTOR_WEB_SERVER_PORT: String(actorPort),
+                APIFY_TOKEN: 'apify-run-token',
+                APIFY_ACTOR_RUN_ID: 'run_e2e_fail',
+            },
+            storageDir,
+        );
+    }, 60_000);
+
+    afterAll(async () => {
+        await anthropic?.close();
+        await upstream?.close();
+    });
+
+    it('exits non-zero', () => {
+        expect(result.code).not.toBe(0);
+    });
+
+    it('still writes a default-dataset row with error=setup_failed', async () => {
+        const items = await readDataset(storageDir);
+        expect(items).toHaveLength(1);
+        expect(items[0].error).toBe('setup_failed');
+        expect(items[0].answer).toBe('');
+        expect(typeof items[0].errorMessage).toBe('string');
     });
 });

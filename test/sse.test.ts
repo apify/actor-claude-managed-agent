@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest';
 import {
     agentMessageText,
     consumeSessionStream,
+    finalAnswerText,
     frameToEvent,
-    lastAgentMessageText,
     readableToAsyncIterable,
     splitFrames,
     SseParser,
@@ -50,7 +50,7 @@ describe('frameToEvent', () => {
     });
 });
 
-describe('SseParser chunk boundaries', () => {
+describe('SseParser', () => {
     it('reassembles an event split across chunks', () => {
         const p = new SseParser();
         expect(p.push('data: {"ty')).toEqual([]);
@@ -63,9 +63,16 @@ describe('SseParser chunk boundaries', () => {
         const out = p.push('data: {"type":"a"}\n\ndata: {"type":"b"}\n\n');
         expect(out.map((e) => e.type)).toEqual(['a', 'b']);
     });
+
+    it('flush() parses a trailing frame not terminated by a blank line', () => {
+        const p = new SseParser();
+        expect(p.push('data: {"type":"session.status_idle"}')).toEqual([]); // buffered, no \n\n
+        expect(p.flush().map((e) => e.type)).toEqual(['session.status_idle']);
+        expect(p.flush()).toEqual([]); // buffer cleared
+    });
 });
 
-describe('agentMessageText / lastAgentMessageText', () => {
+describe('agentMessageText / finalAnswerText', () => {
     it('concatenates text blocks of agent.message', () => {
         const ev: SessionStreamEvent = {
             type: 'agent.message',
@@ -82,13 +89,26 @@ describe('agentMessageText / lastAgentMessageText', () => {
         expect(agentMessageText({ type: 'agent.thinking' })).toBeNull();
     });
 
-    it('picks the LAST non-empty agent.message', () => {
+    it('returns the final-answer run after the last tool use', () => {
         const events: SessionStreamEvent[] = [
-            { type: 'agent.message', content: [{ type: 'text', text: 'first' }] },
-            { type: 'agent.tool_use' },
-            { type: 'agent.message', content: [{ type: 'text', text: 'final' }] },
+            { type: 'agent.message', content: [{ type: 'text', text: 'let me check' }] },
+            { type: 'agent.mcp_tool_use' },
+            { type: 'agent.message', content: [{ type: 'text', text: 'the answer' }] },
         ];
-        expect(lastAgentMessageText(events)).toBe('final');
+        expect(finalAnswerText(events)).toBe('the answer');
+    });
+
+    it('joins a multi-frame final answer (no tool boundary)', () => {
+        const events: SessionStreamEvent[] = [
+            { type: 'agent.message', content: [{ type: 'text', text: 'part 1' }] },
+            { type: 'span.model_request_end' }, // non-message, non-tool: skipped, not a boundary
+            { type: 'agent.message', content: [{ type: 'text', text: 'part 2' }] },
+        ];
+        expect(finalAnswerText(events)).toBe('part 1\npart 2');
+    });
+
+    it('returns empty when there is no trailing message', () => {
+        expect(finalAnswerText([{ type: 'agent.mcp_tool_use' }])).toBe('');
     });
 });
 
@@ -114,7 +134,7 @@ describe('consumeSessionStream', () => {
         expect(res.errorMessage).toBe('boom');
     });
 
-    it('does NOT terminate on a recoverable session.error alone', async () => {
+    it('clears the recovered session.error message on a successful idle', async () => {
         const stream = chunks(
             'data: {"type":"session.error","error":{"message":"transient"}}\n\n',
             'data: {"type":"agent.message","content":[{"type":"text","text":"recovered"}]}\n\n',
@@ -122,12 +142,30 @@ describe('consumeSessionStream', () => {
         );
         const res = await consumeSessionStream(stream, () => {});
         expect(res.outcome).toBe('idle');
-        expect(res.errorMessage).toBe('transient');
+        expect(res.errorMessage).toBeNull();
     });
 
-    it('reports stream_dropped when stream ends with no terminal event', async () => {
-        const res = await consumeSessionStream(chunks('data: {"type":"agent.message"}\n\n'), () => {});
+    it('treats a clean close after an answer (no idle frame) as success', async () => {
+        const stream = chunks(
+            'data: {"type":"agent.message","content":[{"type":"text","text":"done"}]}\n\n',
+        );
+        const res = await consumeSessionStream(stream, () => {});
+        expect(res.outcome).toBe('idle');
+    });
+
+    it('reports stream_dropped when the stream ends with no answer and no terminal', async () => {
+        const res = await consumeSessionStream(chunks('data: {"type":"agent.thinking"}\n\n'), () => {});
         expect(res.outcome).toBe('stream_dropped');
+    });
+
+    it('parses a terminal frame that lacks a trailing blank line before close', async () => {
+        // Final idle frame arrives WITHOUT the trailing \n\n, then the stream closes.
+        const stream = chunks(
+            'data: {"type":"agent.message","content":[{"type":"text","text":"x"}]}\n\n',
+            'data: {"type":"session.status_idle"}',
+        );
+        const res = await consumeSessionStream(stream, () => {});
+        expect(res.outcome).toBe('idle');
     });
 
     it('maps an aborted stream to timeout', async () => {
@@ -139,6 +177,20 @@ describe('consumeSessionStream', () => {
         }
         const res = await consumeSessionStream(throwing(), () => {}, controller.signal);
         expect(res.outcome).toBe('timeout');
+    });
+
+    it('preserves a multibyte char split across the final chunk boundary', async () => {
+        // '✓' is e2 9c 93; split the 3 bytes across two chunks, last frame unterminated.
+        const bytes = enc('data: {"type":"agent.message","content":[{"type":"text","text":"✓"}]}');
+        const cut = bytes.length - 1; // split the last UTF-8 byte off
+        async function* split(): AsyncIterable<Uint8Array> {
+            yield bytes.slice(0, cut);
+            yield bytes.slice(cut);
+        }
+        const seen: SessionStreamEvent[] = [];
+        const res = await consumeSessionStream(split(), (e) => seen.push(e));
+        expect(res.outcome).toBe('idle'); // saw an answer
+        expect(agentMessageText(seen[0]!)).toBe('✓'); // not corrupted/dropped
     });
 });
 

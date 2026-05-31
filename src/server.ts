@@ -38,6 +38,12 @@ export interface StartServerOptions {
     apifyMcpProxyBaseUrl: string;
     /** Run's APIFY_TOKEN — used both for incoming Bearer validation and downstream auth. */
     apifyToken: string;
+    /**
+     * Per-request timeout for upstream MCP calls. Defaults (in mcp.ts) to the
+     * SDK's ~60s, which is too short for slow connector tools (scrapers). Pass
+     * the run's remaining budget so legitimately long tool calls aren't cut off.
+     */
+    upstreamRequestTimeoutMs?: number;
 }
 
 export interface StartedServer {
@@ -46,7 +52,7 @@ export interface StartedServer {
 }
 
 export async function startServer(options: StartServerOptions): Promise<StartedServer> {
-    const { serverPort, apifyMcpProxyBaseUrl, apifyToken } = options;
+    const { serverPort, apifyMcpProxyBaseUrl, apifyToken, upstreamRequestTimeoutMs } = options;
     log.info('Starting MCP HTTP Server', { serverPort, apifyMcpProxyBaseUrl });
 
     const transports: Record<string, { transport: StreamableHTTPServerTransport; connectorId: string }> = {};
@@ -157,7 +163,7 @@ export async function startServer(options: StartServerOptions): Promise<StartedS
                 log.info('New session — opening upstream MCP client', { connectorId, upstreamUrl });
                 let mcpServer;
                 try {
-                    mcpServer = await getMcpServer({ upstreamUrl, apifyToken });
+                    mcpServer = await getMcpServer({ upstreamUrl, apifyToken }, { timeout: upstreamRequestTimeoutMs });
                 } catch (upstreamError) {
                     log.error('Failed to open upstream MCP client', {
                         upstreamUrl,

@@ -133,6 +133,8 @@ The test suite includes an end-to-end test that boots the real Actor against a f
 
 The Apify MCP Proxy is in active development. Some providers (e.g. Notion) work with zero setup; many major OAuth providers (GitHub, Slack, Google, Microsoft) currently need a "user-provided OAuth client" when you create the connector. See the [MCP Connectors docs](https://docs.apify.com/platform/integrations/mcp).
 
+Connectors whose MCP server issues **server→client requests** (sampling, elicitation, roots) are not supported: the local proxy forwards tools and notifications, but not those request types.
+
 ## Resources
 
 - [Anthropic Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview)

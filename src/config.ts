@@ -40,6 +40,12 @@ function requireEnv(env: Env, name: string): string {
     return v;
 }
 
+/** Parse a TCP port. Falls back on anything not a positive integer (avoids the `Number(x)||default` falsy-zero trap). */
+function parsePort(value: string | undefined, fallback: number): number {
+    const n = Number(value);
+    return Number.isInteger(n) && n > 0 && n <= 65_535 ? n : fallback;
+}
+
 export function processInput(raw: RawInput, env: Env): Config {
     const mcpProxyOnly = raw.mcpProxyOnly === true;
 
@@ -78,7 +84,7 @@ export function processInput(raw: RawInput, env: Env): Config {
         containerUrl: needsProxy
             ? (env.APIFY_CONTAINER_URL ?? env.ACTOR_WEB_SERVER_URL ?? requireEnv(env, 'APIFY_CONTAINER_URL'))
             : (env.APIFY_CONTAINER_URL ?? env.ACTOR_WEB_SERVER_URL ?? ''),
-        webServerPort: Number(env.ACTOR_WEB_SERVER_PORT) || 4321,
+        webServerPort: parsePort(env.ACTOR_WEB_SERVER_PORT, 4321),
         runId: env.APIFY_ACTOR_RUN_ID || `local-${Date.now()}`,
     };
 
@@ -106,8 +112,11 @@ export function computeDeadlineMs(
     offsetMs = 30_000,
     fallbackMs = 10 * 60_000,
 ): number {
-    if (!timeoutAt) return fallbackMs;
+    // Clamp to the setTimeout 32-bit max so a far-future/garbage deadline can't
+    // overflow and fire immediately.
+    const MAX_TIMER_MS = 2_147_483_647;
+    if (!timeoutAt) return Math.min(fallbackMs, MAX_TIMER_MS);
     const at = Date.parse(timeoutAt);
-    if (Number.isNaN(at)) return fallbackMs;
-    return Math.max(1_000, at - now - offsetMs);
+    if (Number.isNaN(at)) return Math.min(fallbackMs, MAX_TIMER_MS);
+    return Math.min(MAX_TIMER_MS, Math.max(1_000, at - now - offsetMs));
 }

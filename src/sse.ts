@@ -57,8 +57,9 @@ export function frameToEvent(frame: string): SessionStreamEvent | null {
 
 /**
  * Adapt a web `ReadableStream` (what `fetch().body` is) to an async iterable
- * of byte chunks via a reader. Works regardless of whether the runtime's
- * ReadableStream implements `Symbol.asyncIterator`.
+ * of byte chunks via a reader. Cancels the underlying stream on early exit
+ * (e.g. when the consumer `return`s on a terminal event), so the HTTP body is
+ * torn down rather than left dangling.
  */
 export async function* readableToAsyncIterable(
     stream: ReadableStream<Uint8Array>,
@@ -71,6 +72,8 @@ export async function* readableToAsyncIterable(
             if (value) yield value;
         }
     } finally {
+        // cancel() (not just releaseLock()) closes the body / underlying socket.
+        await reader.cancel().catch(() => {});
         reader.releaseLock();
     }
 }
@@ -83,12 +86,22 @@ export class SseParser {
         this.buffer += chunk;
         const { frames, rest } = splitFrames(this.buffer);
         this.buffer = rest;
-        const events: SessionStreamEvent[] = [];
-        for (const frame of frames) {
-            const ev = frameToEvent(frame);
-            if (ev) events.push(ev);
-        }
-        return events;
+        return frames.map(frameToEvent).filter((e): e is SessionStreamEvent => e !== null);
+    }
+
+    /**
+     * Parse any buffered trailing frame that was NOT terminated by a blank
+     * line before the stream ended. A well-behaved server terminates every
+     * frame with `\n\n`, but some close the connection right after the final
+     * event without the trailing blank line; without this the final
+     * (possibly terminal) event would be silently dropped.
+     */
+    flush(): SessionStreamEvent[] {
+        const tail = this.buffer.trim();
+        this.buffer = '';
+        if (!tail) return [];
+        const ev = frameToEvent(tail);
+        return ev ? [ev] : [];
     }
 }
 
@@ -101,20 +114,38 @@ export function agentMessageText(event: SessionStreamEvent): string | null {
     return texts.length ? texts.join('\n') : null;
 }
 
-/** Last non-empty `agent.message` text across a list of observed events. */
-export function lastAgentMessageText(events: SessionStreamEvent[]): string {
+/** Tool events mark the boundary between the final answer and earlier turns. */
+const TOOL_EVENT_TYPES = new Set([
+    'agent.tool_use',
+    'agent.mcp_tool_use',
+    'agent.tool_result',
+    'agent.mcp_tool_result',
+]);
+
+/**
+ * The agent's final answer: the text of the trailing run of `agent.message`
+ * events (those after the last tool use/result). This is robust whether the
+ * answer arrives as a single `agent.message` or is split across several
+ * consecutive frames, and it excludes interim chatter that preceded a tool
+ * call. Non-message, non-tool events (thinking, spans) between message frames
+ * are skipped, not treated as a boundary.
+ */
+export function finalAnswerText(events: SessionStreamEvent[]): string {
+    const texts: string[] = [];
     for (let i = events.length - 1; i >= 0; i--) {
-        const text = agentMessageText(events[i]);
-        if (text) return text;
+        const event = events[i];
+        if (event.type && TOOL_EVENT_TYPES.has(event.type)) break;
+        const text = agentMessageText(event);
+        if (text) texts.unshift(text);
     }
-    return '';
+    return texts.join('\n');
 }
 
 export type StreamOutcome = 'idle' | 'terminated' | 'timeout' | 'stream_dropped';
 
 export interface StreamResult {
     outcome: StreamOutcome;
-    /** Latest session.error message observed, if any. */
+    /** Latest session.error message observed on an abnormal outcome; null on success. */
     errorMessage: string | null;
 }
 
@@ -125,13 +156,19 @@ const TERMINAL_TYPES = new Set(['session.status_idle', 'session.status_terminate
  * Consume a byte stream of SSE events, invoking `onEvent` for every parsed
  * event, until a terminal event arrives or the stream ends/aborts.
  *
- * `session.error` is recorded but NOT treated as terminal: the docs note it
- * carries a `retry_status`, so the harness may recover. We surface the last
- * error message only if the run ultimately ends abnormally.
+ * Outcomes:
+ *  - `idle`           — saw `session.status_idle`, OR the stream closed cleanly
+ *                       after delivering at least one answer message (some
+ *                       servers signal end-of-turn by closing the connection
+ *                       without a trailing idle frame).
+ *  - `terminated`     — saw `session.status_terminated`.
+ *  - `timeout`        — the caller's AbortSignal fired (deadline).
+ *  - `stream_dropped` — the stream ended/failed with no terminal event and no
+ *                       answer captured.
  *
- * Timeout/abort is the caller's job: pass an `AbortSignal` to the fetch that
- * produced `stream`. When aborted, iteration throws and we map it to the
- * `timeout` outcome (if `signal.aborted`) or `stream_dropped`.
+ * `session.error` is recorded but NOT treated as terminal: the docs note it
+ * carries a `retry_status`, so the harness may recover. The message is
+ * surfaced only on an abnormal outcome (cleared on success).
  */
 export async function consumeSessionStream(
     stream: AsyncIterable<Uint8Array>,
@@ -140,29 +177,40 @@ export async function consumeSessionStream(
 ): Promise<StreamResult> {
     const parser = new SseParser();
     const decoder = new TextDecoder();
-    let errorMessage: string | null = null;
+    let lastErrorMessage: string | null = null;
+    let sawAnswer = false;
+
+    // Process a batch of parsed events; return a terminal StreamResult or null.
+    const handle = (events: SessionStreamEvent[]): StreamResult | null => {
+        for (const event of events) {
+            onEvent(event);
+            if (agentMessageText(event)) sawAnswer = true;
+            if (event.type === 'session.error' && event.error?.message) {
+                lastErrorMessage = event.error.message;
+            }
+            if (event.type && TERMINAL_TYPES.has(event.type)) {
+                const idle = event.type === 'session.status_idle';
+                return { outcome: idle ? 'idle' : 'terminated', errorMessage: idle ? null : lastErrorMessage };
+            }
+        }
+        return null;
+    };
 
     try {
         for await (const chunk of stream) {
-            for (const event of parser.push(decoder.decode(chunk, { stream: true }))) {
-                onEvent(event);
-                if (event.type === 'session.error' && event.error?.message) {
-                    errorMessage = event.error.message;
-                }
-                if (event.type && TERMINAL_TYPES.has(event.type)) {
-                    return {
-                        outcome: event.type === 'session.status_idle' ? 'idle' : 'terminated',
-                        errorMessage,
-                    };
-                }
-            }
+            const result = handle(parser.push(decoder.decode(chunk, { stream: true })));
+            if (result) return result;
         }
+        // Flush any buffered multibyte tail + any frame not terminated by `\n\n`.
+        const tailResult = handle([...parser.push(decoder.decode()), ...parser.flush()]);
+        if (tailResult) return tailResult;
     } catch (err) {
-        if (signal?.aborted) return { outcome: 'timeout', errorMessage };
-        return { outcome: 'stream_dropped', errorMessage: errorMessage ?? (err as Error).message };
+        if (signal?.aborted) return { outcome: 'timeout', errorMessage: lastErrorMessage };
+        return { outcome: 'stream_dropped', errorMessage: lastErrorMessage ?? (err as Error).message };
     }
 
-    // Stream closed without a terminal event.
-    if (signal?.aborted) return { outcome: 'timeout', errorMessage };
-    return { outcome: 'stream_dropped', errorMessage };
+    if (signal?.aborted) return { outcome: 'timeout', errorMessage: lastErrorMessage };
+    // Clean close with an answer = success; otherwise a genuine drop.
+    if (sawAnswer) return { outcome: 'idle', errorMessage: null };
+    return { outcome: 'stream_dropped', errorMessage: lastErrorMessage };
 }

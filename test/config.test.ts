@@ -37,6 +37,14 @@ describe('processInput — happy path', () => {
         });
         expect(cfg.apify.containerUrl).toBe('https://fallback.runs.apify.net');
     });
+
+    it('parses the web server port and rejects non-positive-integer values', () => {
+        expect(processInput({ prompt: 'hi' }, { ...fullEnv, ACTOR_WEB_SERVER_PORT: '8080' }).apify.webServerPort).toBe(8080);
+        // falsy-zero / garbage must NOT collapse to a wrong port — fall back to default
+        expect(processInput({ prompt: 'hi' }, { ...fullEnv, ACTOR_WEB_SERVER_PORT: '0' }).apify.webServerPort).toBe(4321);
+        expect(processInput({ prompt: 'hi' }, { ...fullEnv, ACTOR_WEB_SERVER_PORT: 'abc' }).apify.webServerPort).toBe(4321);
+        expect(processInput({ prompt: 'hi' }, { ...fullEnv, ACTOR_WEB_SERVER_PORT: undefined }).apify.webServerPort).toBe(4321);
+    });
 });
 
 describe('processInput — validation', () => {
@@ -98,5 +106,10 @@ describe('computeDeadlineMs', () => {
     it('falls back when timeoutAt is null or invalid', () => {
         expect(computeDeadlineMs(null, now, 30_000, 99)).toBe(99);
         expect(computeDeadlineMs('not-a-date', now, 30_000, 99)).toBe(99);
+    });
+
+    it('clamps a far-future deadline to the setTimeout 32-bit max', () => {
+        const farFuture = new Date(now + 1_000 * 24 * 3600_000).toISOString(); // ~1000 days out
+        expect(computeDeadlineMs(farFuture, now, 30_000)).toBe(2_147_483_647);
     });
 });

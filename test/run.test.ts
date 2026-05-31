@@ -71,13 +71,13 @@ const baseParams = (client: AnthropicAgents, connectorIds: string[]) => ({
 describe('executeAgentRun — with connectors', () => {
     it('runs the full sequence and returns the final answer', async () => {
         const { client, calls } = makeMockClient();
-        const refs: RunRefs = { vaultId: null, sessionId: null };
+        const refs: RunRefs = { vaultId: null, sessionId: null, events: [] };
         const result = await executeAgentRun(baseParams(client, ['a', 'b']), refs);
 
         expect(result.outcome).toBe('idle');
         expect(result.answer).toBe('final answer');
         expect(result.sessionId).toBe('ses_1');
-        expect(result.events).toHaveLength(4);
+        expect(refs.events).toHaveLength(4);
         expect(refs.vaultId).toBe('vlt_1');
         expect(refs.sessionId).toBe('ses_1');
 
@@ -97,7 +97,7 @@ describe('executeAgentRun — with connectors', () => {
 
     it('sets credential URLs that match the session mcp_servers URLs (byte-match)', async () => {
         const { client, calls } = makeMockClient();
-        await executeAgentRun(baseParams(client, ['a']), { vaultId: null, sessionId: null });
+        await executeAgentRun(baseParams(client, ['a']), { vaultId: null, sessionId: null, events: [] });
 
         const credCall = calls.find((c) => c.path.endsWith('/credentials'));
         const credUrl = (credCall!.body as { auth: { mcp_server_url: string } }).auth.mcp_server_url;
@@ -113,7 +113,7 @@ describe('executeAgentRun — with connectors', () => {
         const { client, calls } = makeMockClient({
             sessionTools: [{ type: 'agent_toolset_20260401' }, { type: 'mcp_toolset', mcp_server_name: 'stale' }],
         });
-        await executeAgentRun(baseParams(client, ['a']), { vaultId: null, sessionId: null });
+        await executeAgentRun(baseParams(client, ['a']), { vaultId: null, sessionId: null, events: [] });
 
         const updateCall = calls.find((c) => c.path === '/v1/sessions/ses_1' && c.method === 'POST');
         const tools = (updateCall!.body as { agent: { tools: Array<{ type: string; mcp_server_name?: string }> } }).agent.tools;
@@ -125,7 +125,7 @@ describe('executeAgentRun — with connectors', () => {
 describe('executeAgentRun — without connectors', () => {
     it('skips vault + session update, still streams', async () => {
         const { client, calls } = makeMockClient();
-        const refs: RunRefs = { vaultId: null, sessionId: null };
+        const refs: RunRefs = { vaultId: null, sessionId: null, events: [] };
         const result = await executeAgentRun(baseParams(client, []), refs);
 
         expect(result.answer).toBe('final answer');
@@ -150,7 +150,7 @@ describe('executeAgentRun — failure modes', () => {
                 'data: {"id":"e3","type":"session.status_terminated"}\n\n',
             ],
         });
-        const result = await executeAgentRun(baseParams(client, []), { vaultId: null, sessionId: null });
+        const result = await executeAgentRun(baseParams(client, []), { vaultId: null, sessionId: null, events: [] });
         expect(result.outcome).toBe('terminated');
         expect(result.errorMessage).toBe('model overloaded');
         expect(result.answer).toBe('partial work');
@@ -174,10 +174,39 @@ describe('executeAgentRun — failure modes', () => {
             return new Response('{}', { status: 200 });
         });
         const client = new AnthropicAgents({ apiKey: 'sk', fetchImpl: fetchImpl as unknown as typeof fetch });
-        const refs: RunRefs = { vaultId: null, sessionId: null };
+        const refs: RunRefs = { vaultId: null, sessionId: null, events: [] };
 
         await expect(executeAgentRun(baseParams(client, ['a']), refs)).rejects.toThrow(/bad agent/);
         expect(refs.vaultId).toBe('vlt_9'); // cleanup can now delete it
+    });
+});
+
+describe('executeAgentRun — deadline', () => {
+    it('classifies a deadline abort during stream-open as timeout, not a crash', async () => {
+        const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+            const u = new URL(typeof url === 'string' ? url : url.toString());
+            if (u.pathname === '/v1/sessions') return new Response(JSON.stringify({ id: 'ses_t' }), { status: 200 });
+            if (u.pathname.endsWith('/events/stream')) {
+                // Never resolve until the deadline AbortController aborts.
+                return new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+                });
+            }
+            return new Response('{}', { status: 200 });
+        });
+        const client = new AnthropicAgents({ apiKey: 'sk', fetchImpl: fetchImpl as unknown as typeof fetch });
+        // Deadline floors to ~1s: at = now+1s, offset 30s → max(1000, negative) = 1000ms.
+        const timeoutAt = new Date(Date.now() + 1_000).toISOString();
+        const refs: RunRefs = { vaultId: null, sessionId: null, events: [] };
+        const result = await executeAgentRun({ ...baseParams(client, []), timeoutAt }, refs);
+        expect(result.outcome).toBe('timeout');
+        expect(result.sessionId).toBe('ses_t');
+    });
+
+    it('creates one credential per connector', async () => {
+        const { client, calls } = makeMockClient();
+        await executeAgentRun(baseParams(client, ['a', 'b', 'c']), { vaultId: null, sessionId: null, events: [] });
+        expect(calls.filter((c) => c.path.endsWith('/credentials'))).toHaveLength(3);
     });
 });
 

@@ -15,9 +15,11 @@
  * script does.
  */
 
-const BASE = process.env.ANTHROPIC_BASE_URL?.replace(/\/$/, '') ?? 'https://api.anthropic.com';
-const BETA = 'managed-agents-2026-04-01';
-const VERSION = '2023-06-01';
+import { ANTHROPIC_BETA, ANTHROPIC_DEFAULT_BASE, ANTHROPIC_VERSION } from '../src/anthropic.js';
+
+const BASE = process.env.ANTHROPIC_BASE_URL?.replace(/\/$/, '') || ANTHROPIC_DEFAULT_BASE;
+const BETA = ANTHROPIC_BETA;
+const VERSION = ANTHROPIC_VERSION;
 
 interface Args {
     name: string;
@@ -29,7 +31,11 @@ interface Args {
 function parseArgs(argv: string[]): Args {
     const get = (flag: string): string | undefined => {
         const i = argv.indexOf(flag);
-        return i >= 0 ? argv[i + 1] : undefined;
+        if (i < 0) return undefined;
+        const next = argv[i + 1];
+        // Guard against a missing value swallowing the following flag.
+        if (next === undefined || next.startsWith('--')) fail(`Flag ${flag} requires a value.`);
+        return next;
     };
     if (argv.includes('--help') || argv.includes('-h')) {
         printHelpAndExit(0);
@@ -82,7 +88,11 @@ async function api<T>(path: string, body: unknown): Promise<T> {
     if (!res.ok) {
         throw new Error(`POST ${path} → ${res.status}: ${text}`);
     }
-    return JSON.parse(text) as T;
+    try {
+        return JSON.parse(text) as T;
+    } catch {
+        throw new Error(`POST ${path} → ${res.status}: response was not JSON: ${text.slice(0, 200)}`);
+    }
 }
 
 async function main(): Promise<void> {

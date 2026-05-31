@@ -11,9 +11,14 @@
 
 import type { AgentTool, McpServerDef } from './agent-config.js';
 
-const DEFAULT_BASE = 'https://api.anthropic.com';
-const BETA = 'managed-agents-2026-04-01';
-const VERSION = '2023-06-01';
+/** Shared so scripts/provision.ts uses the same beta/version (no lockstep drift). */
+export const ANTHROPIC_DEFAULT_BASE = 'https://api.anthropic.com';
+export const ANTHROPIC_BETA = 'managed-agents-2026-04-01';
+export const ANTHROPIC_VERSION = '2023-06-01';
+
+const DEFAULT_BASE = ANTHROPIC_DEFAULT_BASE;
+const BETA = ANTHROPIC_BETA;
+const VERSION = ANTHROPIC_VERSION;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 export interface Vault {
