@@ -91,6 +91,11 @@ export async function getMcpServer(
         });
     }
 
+    // NOTE: server→client *requests* (sampling/createMessage, elicitation/create,
+    // roots/list) are NOT forwarded. The SDK gates those handlers on negotiated
+    // capabilities on both legs, so a naive passthrough breaks the common path.
+    // Connectors that need them are unsupported for now (rare for Apify connectors).
+
     server.server.onclose = () => {
         log.info('MCP Server is closing, shutting down the proxy client');
         proxyClient.close().catch((error) => {

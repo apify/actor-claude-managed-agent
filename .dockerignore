@@ -10,3 +10,5 @@ apify_storage
 .DS_Store
 *.log
 README.md
+test
+vitest.config.ts

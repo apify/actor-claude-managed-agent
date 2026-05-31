@@ -7,9 +7,10 @@
             "transformation": {
                 "fields": [
                     "answer",
-                    "agentId",
+                    "prompt",
                     "sessionId",
-                    "environmentId",
+                    "error",
+                    "partial",
                     "durationMs",
                     "finishedAt"
                 ]
@@ -17,12 +18,13 @@
             "display": {
                 "component": "table",
                 "properties": {
-                    "answer":        { "label": "Answer",         "format": "text" },
-                    "agentId":       { "label": "Agent ID",       "format": "text" },
-                    "sessionId":     { "label": "Session ID",     "format": "text" },
-                    "environmentId": { "label": "Environment ID", "format": "text" },
-                    "durationMs":    { "label": "Duration (ms)",  "format": "number" },
-                    "finishedAt":    { "label": "Finished At",    "format": "date" }
+                    "answer":     { "label": "Answer",        "format": "text" },
+                    "prompt":     { "label": "Prompt",        "format": "text" },
+                    "sessionId":  { "label": "Session ID",    "format": "text" },
+                    "error":      { "label": "Error",         "format": "text" },
+                    "partial":    { "label": "Partial",       "format": "boolean" },
+                    "durationMs": { "label": "Duration (ms)", "format": "number" },
+                    "finishedAt": { "label": "Finished At",   "format": "date" }
                 }
             }
         }
